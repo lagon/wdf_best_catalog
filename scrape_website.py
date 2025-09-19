@@ -1,16 +1,319 @@
+import concurrent.futures as futures
 import hashlib
+import io
+import itertools
 import json
 import os
+import time
+import traceback
 import typing as t
+import random
 
-import tqdm
+import pydantic as pyd
+
+import bs4
 from bs4 import BeautifulSoup
+import pandas as pd
 import requests
 import urllib.parse as urlparse
+import tqdm
+import openai as oai
+from resources.template_codes import TEMPLATE_CODES
 
+
+class ProductDim(pyd.BaseModel):
+    height: int
+    length: int
+    thickness: int
+
+class ProductDimensions(pyd.BaseModel):
+    dimensions: t.List[ProductDim]
+
+
+def make_batch(client: oai.OpenAI, batch_input: t.List[t.Dict]) -> str:
+    content_lines = []
+    for bi in batch_input:
+        content_lines.append(json.dumps(bi))
+    jsonl_content = "\n".join(content_lines)
+
+    oai_file = client.files.create(file=io.BytesIO(jsonl_content.encode("utf-8")), purpose="batch") #, expires_after={"anchor": "created_at", "seconds": 90000})
+
+    batch = client.batches.create(
+        input_file_id=oai_file.id,
+        endpoint="/v1/responses",
+        completion_window="24h"
+    )
+    return batch.id
+
+def product_web_extraction_prompts(model_name: str, product_detail_desc: str) -> t.List:
+    """
+    Create a batch job with two requests (description extraction + table extraction).
+    Returns the batch id.
+    """
+    batch_input = [
+        {
+            "custom_id": "description",
+            "method": "POST",
+            "url": "/v1/responses",
+            "body": {
+                "model": model_name,
+                "input": [
+                    {"role": "developer", "content": """Remove html tags from following part of the web page. Keep basic formatting, like paragraphs or lists and bullet points, replace those with stars. Also remove all the table data from the page. Make sure all outputs are in Czech."""},
+                    {"role": "user", "content": product_detail_desc}
+                ],
+            },
+        },
+        {
+            "custom_id": "table",
+            "method": "POST",
+            "url": "/v1/responses",
+            "body": {
+                "model": model_name,
+                "input": [
+                    {"role": "developer", "content": """The following piece of the HTML contains one or more HMTL tables containing product name, it's dimensions and packaging. Extract the content of the table(s) in row-order. Precede each cell in the table with the column name and each row in the table on the single line. Extract only name of the product name and it's dimensions (skladebné rozměry). Omit duplicate lines.  Make sure all outputs are in Czech."""},
+                    {"role": "user", "content": product_detail_desc}
+                ],
+            },
+        },
+        # {
+        #     "custom_id": "table",
+        #     "method": "POST",
+        #     "url": "/v1/responses",
+        #     "body": {
+        #         "model": model_name,
+        #         "input": [
+        #             {"role": "developer", "content": """The following piece of the HTML contains various parameters product parameters - typically colour (barva), finish (povrch) and height (výška) of the product, but possibly others as well. Part the    Make sure all outputs are in Czech."""},
+        #             {"role": "user", "content": product_parameters}
+        #         ],
+        #     }
+        # }
+    ]
+    return batch_input
+
+def wait_for_batch(client: oai.OpenAI, batch_id: str, batch_poll_interval_secs: int) -> oai.types.Batch:
+    """
+    Poll until the batch job completes or fails. Returns the batch object.
+    """
+    while True:
+        batch = client.batches.retrieve(batch_id)
+        print(f"TICK-TOCK {batch.id} status {batch.status}")
+        if batch.status in ("completed", "failed", "expired", "cancelled"):
+            return batch
+        time.sleep(batch_poll_interval_secs)
+
+
+def parse_batch_results(client: oai.OpenAI, batch: oai.types.Batch) -> t.Dict[str, str]:
+    """
+    Download and parse the batch output. Returns description_text, table_text.
+    """
+    if not batch.output_file_id:
+        raise RuntimeError(f"Batch {batch.id} did not produce an output file.")
+
+    file_response = client.files.content(batch.output_file_id)
+    file_content = file_response.read().decode("utf-8")
+    results = [json.loads(line) for line in file_content.strip().splitlines()]
+
+    out_data: t.Dict[str, str] = {}
+    for res in results:
+        custom_id = res.get("custom_id")
+        output_text = res["response"]["body"]["output"][0]["content"][0]["text"]
+        out_data[custom_id] = output_text
+
+    return out_data
+
+
+def run_batch_with_retry(client: oai.OpenAI, batch_data: t.List, max_batch_retries: int, batch_poll_interval_secs: int) -> t.Optional[t.Dict[str, str]]:
+    """
+    Run a batch with retry logic for failed/expired/cancelled batches.
+    """
+    for attempt in range(1, max_batch_retries + 1):
+        print("Sending out batches")
+        batch_id = make_batch(client=client, batch_input=batch_data)
+        print(f"Waiting for batch {batch_id} to complete")
+        batch = wait_for_batch(client, batch_id, batch_poll_interval_secs)
+
+        print(f"Batch {batch_id} is finished with status: {batch.status}")
+        if batch.status == "completed":
+            return parse_batch_results(client, batch)
+
+        print(f"⚠️ Batch {batch_id} failed with status={batch.status}, attempt {attempt}/{max_batch_retries}")
+
+        if attempt == max_batch_retries:
+            raise RuntimeError(f"Batch failed after {max_batch_retries} attempts (last status={batch.status}).")
+
+        time.sleep(2 * attempt)  # backoff before retry
+    return None
+
+
+def extract_text_description_and_table(product_title: str, product_detail_desc: str) -> t.Optional[t.Tuple[str, str]]:
+    """
+    Main function: cache results locally, otherwise run batch job (with retry) and return results.
+    """
+    # Cache filename
+    fname = os.path.join(
+        "/home/cepekmir/Sources/wdf_best_catalog/tmp",
+        f"content-{hashlib.md5(";;;".join([product_title, product_detail_desc]).encode()).hexdigest()}.json"
+    )
+
+    model_name = "gpt-4.1-mini"
+    client = oai.OpenAI(api_key=os.environ.get("OPEN_AI_API_KEY"))
+
+    # Return from cache if available
+    if os.path.isfile(fname):
+        with open(fname, "rt", encoding="utf-8") as f:
+            cont = json.load(f)
+            return cont["description"], cont["table"]
+
+    # Run batch with retry
+    batch_data = product_web_extraction_prompts(model_name=model_name, product_detail_desc=product_detail_desc)
+    batch_res = run_batch_with_retry(client=client, batch_data=batch_data, max_batch_retries=3, batch_poll_interval_secs=10)
+    if batch_res is None:
+        return None
+
+    # Save to cache
+    with open(fname, "wt", encoding="utf-8") as f:
+        json.dump(batch_res, f, ensure_ascii=False, indent=4)
+
+    return batch_res["description"], batch_res["table"]
+
+def summary_batch_requests(model_name: str,
+                           product_name: str,
+                           short_desc: str,
+                           long_desc: str,
+                           table: str,
+                           prod_group_desc: str,
+                           prod_family_desc: str,
+                           category_desc: str) -> t.List[t.Dict]:
+    """
+    Create a batch job with two requests (description extraction + table extraction).
+    Returns the batch id.
+    """
+    batch_input = [
+        {
+            "custom_id": "product_summary",
+            "method": "POST",
+            "url": "/v1/responses",
+            "body": {
+                "model": model_name,
+                "input": [
+                    {"role": "developer", "content": """Your task is summarise a description of a building product made of pressed concrete. 
+The summary must capture the intended use (garden, home, public roads) and purpose, essential characteristics like  dimensions and colour. 
+If the description captures different flavours of the product, mention them all in the summary. The text will be later used to match 
+products to items enquired by a potential customer. Customer enquires are fuzzy and can be misaligned. So keep all relevant details 
+in the description. The product description is in czech and consists of four elements: product name, short description (marketing paragraph), longer
+description (more technical description) and table with dimensions and details in row order. Make sure, you mention the product name in the summary.
+Keep all replies in Czech language."""},
+                    {"role": "user", "content": f"Product name: {product_name}"},
+                    {"role": "user", "content": f"Short description marketing headline description: {short_desc}"},
+                    {"role": "user", "content": f"Longer, more technical description: {long_desc}"},
+                    {"role": "user", "content": f"Table with dimensions and details in row order, with column names preceding the values {table}."},
+                    {"role": "user", "content": f"The summary:"}
+                ],
+            },
+        },
+        {
+            "custom_id": "hierarchy_summary",
+            "method": "POST",
+            "url": "/v1/responses",
+            "body": {
+                "model": model_name,
+                "input": [
+                    {"role": "developer", "content": """Your task is summarise a description of a building product made of pressed concrete.
+The summary must capture the intended use (garden, home, public roads) and purpose, essential characteristics like  dimensions and colour. 
+If the description captures different flavours of the product, mention them all in the summary. The text will be later used to match 
+products to items enquired by a potential customer. Customer enquires are fuzzy and can be misaligned. So keep all relevant details 
+in the description. The product description is in czech and consists of four elements: product name, short description (marketing paragraph), longer
+description (more technical description) and table with dimensions and details in row order. In addition you get also all the descriptions
+from product hierarchy - from the top, category (most general set of products), product family and product group (lowest level).  Keep all replies in Czech language."""},
+                    {"role": "user", "content": f"Product name: {product_name}"},
+                    {"role": "user", "content": f"Short description marketing headline description: {short_desc}"},
+                    {"role": "user", "content": f"Longer, more technical description: {long_desc}"},
+                    {"role": "user", "content": f"Table with dimensions and details in row order, with column names preceding the values {table}."},
+                    {"role": "user", "content": f"Product group hierarchy: {prod_group_desc}."},
+                    {"role": "user", "content": f"Product family hierarchy: {prod_family_desc}."},
+                    {"role": "user", "content": f"Category hierarchy: {category_desc}."},
+                    {"role": "user", "content": f"The summary:"}
+                ],
+            },
+        },
+        {
+            "custom_id": "classifications",
+            "method": "POST",
+            "url": "/v1/responses",
+            "body": {
+                "model": model_name,
+                "input": [
+                    {"role": "developer", "content": """Your task is classify the product by it's design (for example: zámková dlažba,
+dlažba pro slepce, potrubí, obrubník, etc)., area of use (for example: zahrada, chodníky, kanalizace), load capacity (for example: není zmíněna, 
+pochozí, pojezd osobních automobilů, pojezd nákladních automobilů), finish (for example: mrazuvzdorná, není mrazuvzdorná, 
+odolná proti rozmrazovacím prostředkům) and technical norms mentioned (like: 'ČSN EN 206-1', 'XF4').
+If some of the information is not mentioned or not obvoious, produce empty list.
+Output the is JSON with following structure:
+{
+    'design': ['zámková dlažba'],
+    'area of use': ['zahrada'],
+    'load capacity': ['pochozí'],
+    'finish': ['mrazuvzdorná'],
+    'technical norms': ['XF4']
+}
+Keep all replies in Czech language."""},
+                    {"role": "user", "content": f"Product name: {product_name}"},
+                    {"role": "user", "content": f"Short description marketing headline description: {short_desc}"},
+                    {"role": "user", "content": f"Product group hierarchy: {prod_group_desc}."},
+                    {"role": "user", "content": f"The summary:"}
+                ],
+            },
+        },
+        {
+            "custom_id": "dimensions",
+            "method": "POST",
+            "url": "/v1/responses",
+            "body": {
+                "model": model_name,
+                "input": [
+                    {"role": "developer", "content": """Your task identify dimensions of a product. The product's dimensions
+are shown in the row-wise pseudo-tabular form with column names just before the values. Give just a list of product dimensions
+in JSON format - the example follows: [{'label': 'BEST - AKVAGRAS', 'width': 10, 'length': 50, 'height': 20}]. Only return valid JSON, no extra text and 
+keep only the fields in the example above, do not use any other. Do not prefix the output with json. The column mapping from the HTML table to the fields above typically is:
+label = název; width = šířka, tloušťka or D; length = délka or L and height = výška or t."""},
+                    {"role": "user", "content": f"Table with dimensions and details in row order, with column names preceding the values: {table}."},
+                    {"role": "user", "content": f"Dimensions:"}
+                ],
+            },
+        }
+    ]
+    return batch_input
+
+def get_product_summaries_and_tags(prod_name: str, short_desc: str, long_desc: str, table: str, prod_group_desc: str, prod_family_desc: str, category_desc: str) -> t.Optional[t.Dict[str, str]]:
+    model_name = "gpt-4.1-mini"
+    prod_desc_digest=hashlib.md5(";;;".join([model_name, prod_name, short_desc, long_desc, table, prod_group_desc, prod_family_desc, category_desc]).encode()).hexdigest()
+    fname=os.path.join("/home/cepekmir/Sources/wdf_best_catalog/tmp", f"summary-{prod_desc_digest}.json")
+    if os.path.isfile(fname):
+        with open(fname, mode="rt", encoding="utf-8") as f:
+            return json.load(f)
+
+    client: oai.OpenAI = oai.OpenAI(api_key=os.environ.get("OPEN_AI_API_KEY"))
+    batch_data = summary_batch_requests(model_name=model_name,
+                                        product_name=prod_name,
+                                        short_desc=short_desc,
+                                        long_desc=long_desc,
+                                        table=table,
+                                        prod_group_desc=prod_group_desc,
+                                        prod_family_desc=prod_family_desc,
+                                        category_desc=category_desc)
+
+    batch_res = run_batch_with_retry(client=client, batch_data=batch_data, max_batch_retries=3, batch_poll_interval_secs=10)
+    if batch_res is None:
+        return None
+
+    # Save to cache
+    with open(fname, "wt", encoding="utf-8") as f:
+        json.dump(batch_res, f, ensure_ascii=False, indent=4)
+
+    return batch_res
 
 def download_website(url: str) -> t.Optional[str]:
-    cache_path = os.path.join("/home/cepekmir/Sources/wdf_best_catalog/tmp", hashlib.md5(url.encode()).hexdigest())
+    cache_path = os.path.join("/home/cepekmir/Sources/wdf_best_catalog/tmp/web/", hashlib.md5(url.encode()).hexdigest())
     if os.path.exists(cache_path):
         with open(cache_path, "rt") as f:
             return f.read()
@@ -105,116 +408,43 @@ def extract_details_from_prod_page(webpage: str, web_url: str) -> t.Dict[str, t.
     # Extract all links from them
     # print(web_url)
 
+    if web_url.split("/")[-1] in TEMPLATE_CODES:
+        template_codes = [web_url.split("/")[-1]]
+    else:
+        template_codes = ["NA"] #Chce to vic prace
+
     prod_detail_div = soup.find(name="div", class_="product-detail__header")
-    if prod_detail_div is None:
-        if web_url == "https://www.best.cz/ulicni-destove-vpusti-dn450":
-            return {
-                "product_title": "Uliční vpusti DN 450",
-                "product_short_description": "Uliční vpusti: Nezbytný prvek pro odvod dešťových vod",
-                "product_details_description": """Uliční vpusti: Nezbytný prvek pro odvod dešťových vod
-Uliční vpusti jsou klíčovým prvkem městské infrastruktury, zajišťujícím efektivní zachycování a odvádění dešťových vod z pozemních komunikací a dalších veřejných prostranství. Tyto konstrukce jsou navrženy tak, aby minimalizovaly riziko zaplavení a zajistily plynulý odtok vody do stokové sítě, čímž přispívají k ochraně životního prostředí a zlepšení kvality života ve městech.
-
-Konstrukce a funkce uličních vpustí
-
-Hlavním účelem uličních vpustí je shromažďování dešťových vod a jejich následný odvod do kanalizačního systému. Aby byla zajištěna maximální účinnost a spolehlivost, jsou uliční vpusti často vybaveny lapačem nečistot, známým také jako kalový koš. Tento prvek slouží k zachycování hrubých nečistot, jako je štěrk, listí nebo jiné organické materiály, které by mohly způsobit ucpání odtokového systému. Kalové koše mohou být navrženy buď s kalovou prohlubní, která umožňuje usazování nečistot na dně vpusti, nebo s odtokem ve spodní části, což zajišťuje plynulý průtok vody a minimalizuje riziko ucpání. Tato kombinace zaručuje, že i při intenzivních srážkách je voda účinně odváděna z povrchu komunikací a veřejných prostranství.
-
-Materiály a normy
-
-Pro výrobu uličních vpustí se používá beton třídy C35/45, který splňuje vysoké požadavky na odolnost a pevnost. Tento beton je navržen dle normy ČSN EN 1917:2004, která specifikuje složení betonu pro stupeň vlivu prostředí XF4. To znamená, že beton je odolný vůči mrazu a rozmrazování, což je klíčové pro zajištění dlouhé životnosti a funkčnosti uličních vpustí v náročných klimatických podmínkách.
-
-Význam uličních vpustí v městské infrastruktuře
-
-Uliční vpusti hrají zásadní roli v prevenci povodní a ochraně městské infrastruktury. Efektivní odvádění dešťových vod pomáhá předcházet erozi, poškození silnic a chodníků, a také minimalizuje riziko vzniku stagnačních vod, které mohou být zdrojem nepříjemných zápachů a líhní komárů. Díky pečlivému návrhu a použití kvalitních materiálů představují uliční vpusti spolehlivé řešení pro moderní města, které čelí výzvám spojeným s klimatickými změnami a rostoucím počtem srážek. Zajišťují tak nejen ochranu infrastruktury, ale také přispívají k udržitelnosti a komfortu městského prostředí.""",
-                "product_table_details": """
-"dna skruží DN 450"
-[{"název": "TBV-Q 1a/450/330 dno s výt. DN 150 PVC",	"D (mm)" :450,	"H (mm)" :330,	"t (mm)" :"-",	"hmotnost ks (kg)" :83,	"počet ks na paletě" :16},
-{"název": "TBV-Q 1d/450/380 dno s výt. DN 200 PVC",	"D (mm)" :450,	"H (mm)" :380,	"t (mm)" :"-",	"hmotnost ks (kg)" :87,	"počet ks na paletě" :12},
-{"název": "TBV-Q 1d/450/330 dno s výt. DN 200 bez vložky",	"D (mm)" :450,	"H (mm)" :380,	"t (mm)" :"-",	"hmotnost ks (kg)" :84,	"počet ks na paletě" :12},
-{"název": "TBV-Q 2a/450/300 dno s kalovou prohlubní",	"D (mm)" :450,	"H (mm)" :300,	"t (mm)" :"-",	"hmotnost ks (kg)" :71,	"počet ks na paletě" :16}]
- 
-
-"skruže DN 450"
-[{"název": "TBV-Q 5c/450/195 skruž horní",	"D (mm)" :450,	"H (mm)" :195,	"t (mm)" :50,	"hmotnost ks (kg)" :38,	"počet ks na paletě" :20},
-{"název": "TBV-Q 5b/450/295 skruž horní",	"D (mm)" :450,	"H (mm)" :295,	"t (mm)" :50,	"hmotnost ks (kg)" :57,	"počet ks na paletě" :16},
-{"název": "TBV-Q 5d/450/570 skruž horní",	"D (mm)" :450,	"H (mm)" :570,	"t (mm)" :50,	"hmotnost ks (kg)" :105,	"počet ks na paletě" :8},
-{"název": "TBV-Q 6b/450/195 skruž středová",	"D (mm)" :450,	"H (mm)" :195,	"t (mm)" :50,	"hmotnost ks (kg)" :38,	"počet ks na paletě" :24},
-{"název": "TBV-Q 6a/450/295 skruž středová",	"D (mm)" :450,	"H (mm)" :295,	"t (mm)" :50,	"hmotnost ks (kg)" :56,	"počet ks na paletě" :16},
-{"název": "TBV-Q 6d/450/570 skruž středová",	"D (mm)" :450,	"H (mm)" :570,	"t (mm)" :50,	"hmotnost ks (kg)" :105,	"počet ks na paletě" :8},
-{"název": "TBV-Q 3a/450/350 skruž s výtokem DN 150 PVC",	"D (mm)" :450,	"H (mm)" :350,	"t (mm)" :50,	"hmotnost ks (kg)" :75,	"počet ks na paletě" :16},
-{"název": "TBV-Q 3a/450/350 skruž s výtokem DN 200 PVC",	"D (mm)" :450,	"H (mm)" :350,	"t (mm)" :50,	"hmotnost ks (kg)" :70,	"počet ks na paletě" :16},
-{"název": "TBV-Q 3d/450/450 skruž s výtokem DN 200 bez vložky",	"D (mm)" :450,	"H (mm)" :450,	"t (mm)" :50,	"hmotnost ks (kg)" :90,	"počet ks na paletě" :8},
-{"název": "TBV-Q S/450/550 skruž se zápachovou uzávěrkou DN 150 PVC",	"D (mm)" :450,	"H (mm)" :550,	"t (mm)" :50,	"hmotnost ks (kg)" :180,	"počet ks na paletě" :4},
-{"název": "TBV-Q S/450/550 skruž se zápachovou uzávěrkou DN 200 PVC",	"D (mm)" :450,	"H (mm)" :550,	"t (mm)" :50,	"hmotnost ks (kg)" :190,	"počet ks na paletě" :4},
-{"název": "TBV-Q 11/325 kónus",	"D (mm)" :450/270",	"H (mm)" :325,	"t (mm)" :50,	"hmotnost ks (kg)" :60,	"počet ks na paletě": 12}] 
-
-"prstence DN 450"
-[{"název": "TBV-Q 10a/627/390/60",	"D (mm)" :390,	"H (mm)" :60,	"t (mm)" :"-",	"hmotnost ks (kg)" :23,	"počet ks na paletě" :15},
-{"název": "TBV-Q 10b/500x350/400x2720/60",	"D (mm)" :400/270,	"H (mm)" :60,	"t (mm)" :"-",	"hmotnost ks (kg)" :8,	"počet ks na paletě" :50}]
-"""
-            }
-        if web_url == "https://www.best.cz/ulicni-destove-vpusti-dn500":
-            return {
-                "product_title": "Uliční vpusti DN 500",
-                "product_short_description": "Uliční vpusti: Nezbytný prvek pro odvod dešťových vod",
-                "product_details_description": """Uliční vpusti: Nezbytný prvek pro odvod dešťových vod
-Uliční vpusti jsou klíčovým prvkem městské infrastruktury, zajišťujícím efektivní zachycování a odvádění dešťových vod z pozemních komunikací a dalších veřejných prostranství. Tyto konstrukce jsou navrženy tak, aby minimalizovaly riziko zaplavení a zajistily plynulý odtok vody do stokové sítě, čímž přispívají k ochraně životního prostředí a zlepšení kvality života ve městech.
-
-Konstrukce a funkce uličních vpustí
-
-Hlavním účelem uličních vpustí je shromažďování dešťových vod a jejich následný odvod do kanalizačního systému. Aby byla zajištěna maximální účinnost a spolehlivost, jsou uliční vpusti často vybaveny lapačem nečistot, známým také jako kalový koš. Tento prvek slouží k zachycování hrubých nečistot, jako je štěrk, listí nebo jiné organické materiály, které by mohly způsobit ucpání odtokového systému.
-
-Kalové koše mohou být navrženy buď s kalovou prohlubní, která umožňuje usazování nečistot na dně vpusti, nebo s odtokem ve spodní části, což zajišťuje plynulý průtok vody a minimalizuje riziko ucpání. Tato kombinace zaručuje, že i při intenzivních srážkách je voda účinně odváděna z povrchu komunikací a veřejných prostranství.
-
-Materiály a normy
-
-Pro výrobu uličních vpustí se používá beton třídy C35/45, který splňuje vysoké požadavky na odolnost a pevnost. Tento beton je navržen dle normy ČSN EN 1917:2004, která specifikuje složení betonu pro stupeň vlivu prostředí XF4. To znamená, že beton je odolný vůči mrazu a rozmrazování, což je klíčové pro zajištění dlouhé životnosti a funkčnosti uličních vpustí v náročných klimatických podmínkách.
-
-Význam uličních vpustí v městské infrastruktuře
-
-Uliční vpusti hrají zásadní roli v prevenci povodní a ochraně městské infrastruktury. Efektivní odvádění dešťových vod pomáhá předcházet erozi, poškození silnic a chodníků, a také minimalizuje riziko vzniku stagnačních vod, které mohou být zdrojem nepříjemných zápachů a líhní komárů.
-
-Díky pečlivému návrhu a použití kvalitních materiálů představují uliční vpusti spolehlivé řešení pro moderní města, které čelí výzvám spojeným s klimatickými změnami a rostoucím počtem srážek. Zajišťují tak nejen ochranu infrastruktury, ale také přispívají k udržitelnosti a komfortu městského prostředí.""",
-                "product_table_details": """dna DN 500
-"název": TBV-Q 500/190 D",	"D (mm)" :"500",	H (mm) :"190",	"t (mm)" :"50",	"hmotnost ks (kg)" :"78"
-"název": TBV-Q 500/626 D",	"D (mm)" :"500",	"H (mm)" :"656",	"t (mm)" :"50",	"hmotnost ks (kg)" :"175"
-"název": TBV-Q 500/626/200 VD",	"D (mm)" :"500",	"H (mm)" :"626",	"t (mm)" :"50",	"hmotnost ks (kg)" :"232"
-"název": TBV-Q 500/626/150 VVD",	"D (mm)" :"500",	"H (mm)" :"626",	"t (mm)" :"50",	"hmotnost ks (kg)" :"232"
-"název": TBV-Q 500/626/200 VVD",	"D (mm)" :"500",	"H (mm)" :"626",	"t (mm)" :"50",	"hmotnost ks (kg)" :"232"
-
-skruže DN 500
-"název": TBV-Q 500/590/200 V",	"D (mm)" :"500",	"H (mm)" :"590",	"t (mm)" :"50",	"hmotnost ks (kg)" :"170"
-"název": TBV-Q 500/590/150 VV",	"D (mm)" :"500",	"H (mm)" :"590",	"t (mm)" :"50",	"hmotnost ks (kg)" :"170"
-"název": TBV-Q 500/590/200 VV",	"D (mm)" :"500",	"H (mm)" :"590",	"t (mm)" :"50",	"hmotnost ks (kg)" :"170"
-"název": TBV-Q 500/190",	"D (mm)" :"500",	"H (mm)" :"190",	"t (mm)" :"50",	"hmotnost ks (kg)" :"40"
-"název": TBV-Q 500/290",	"D (mm)" :"500",	"H (mm)" :"290",	"t (mm)" :"50",	"hmotnost ks (kg)" :"60"
-"název": TBV-Q 500/590",	"D (mm)" :"500",	"H (mm)" :"590",	"t (mm)" :"50",	"hmotnost ks (kg)" :"120"
-"název": TBV-Q 500/290 K",	"D (mm)" :"500",	"H (mm)" :"290",	"t (mm)" :"50",	"hmotnost ks (kg)" :"87"
-
-prstence DN 500
-"název": TBV-Q 390/60",	"H (mm)" :"390",	"H (mm)" :"60",	"t (mm)" :"235/85",	"hmotnost ks (kg)" :"64"
-"název": TBV-Q 660/180",	"H (mm)" :"660",	"H (mm)" :"180",	"t (mm)" :"100",	"hmotnost ks (kg)" :"103"
-"název": TBV-Q 660/180/111 S",	"H (mm)" :"660",	"H (mm)" :"180/111",	"t (mm)" :"100",	"hmotnost ks (kg)" :"85"
-"""
-            }
-
-        return {
-            "product_title": "",
-            "product_short_description": "",
-            "product_details_description": "",
-            "product_table_details": ""
-        }
 
     product_title = prod_detail_div.find(name="h1").text
     product_short_description = soup.find(name="div", class_="product-detail-cart__text").text.strip()
-    product_details_description = soup.find(name="div", class_="product-detail-description__content").text.strip()
+    product_long_description = soup.find(name="div", class_="product-detail-description__content").text.strip()
+    product_parameters_element = soup.find(name="div", class_="product-detail-cart__form product-detail-cart__form--params")
 
-    table_details = extract_table_details(webpage, product_title)
+    prod_param_elems_flag = [type(s) is bs4.Tag for s in list(product_parameters_element)]
+    product_parameters_element = list(itertools.compress(list(product_parameters_element), prod_param_elems_flag))
+
+    product_paramters: t.Dict[str, t.Union[str, t.List[str]]] = {}
+    i = 0
+    while i < len(product_parameters_element):
+        label: str = product_parameters_element[i].text.strip()
+        label = label.replace(":", "")
+        value_tag: bs4.Tag = product_parameters_element[i + 1]
+        if value_tag.name == "select":
+            value = [txt.text for txt in list(value_tag.find_all(name="option"))]
+        else:
+            value = product_parameters_element[i + 1].text.strip()
+        product_paramters[label] = value
+        i = i + 2
+
+    product_details_text, product_details_table = extract_text_description_and_table(product_title=product_title, product_detail_desc=product_long_description)
 
     return {
         "product_title": product_title,
         "product_short_description": product_short_description,
-        "product_details_description": product_details_description,
-        "product_table_details": table_details
+        "product_details_description": product_details_text,
+        "product_table_details": product_details_table,
+        "product_parameters": product_paramters,
+        "product_templates": template_codes
     }
 
 def _row_to_formated_cells(row, table_tag):
@@ -247,63 +477,6 @@ def _regularise_table(content_rows):
                 content_rows[row_id][col_id]["rowspan"] = 1
     return content_rows
 
-def extract_table_details(webpage: str, product_title: str) -> t.List[t.Dict[str, t.Any]]:
-    try:
-        soup = BeautifulSoup(webpage, "html.parser")
-        details_table_div = soup.find(name="div", class_="product-detail-description__content")
-        details_table = details_table_div.find(name="tbody")
-        if details_table is None:
-            return []
-        rows = details_table.find_all(name="tr")
-
-        last_row_cell = rows[-1].find("td")
-        if ("colspan" in last_row_cell.attrs) and (last_row_cell.attrs["colspan"] == "14"):
-            rows = rows[:-2]
-
-        headers_all_rows = []
-        content_all_rows = []
-
-        for row in rows:
-            headers = _row_to_formated_cells(row, table_tag="th")
-            if len(headers) > 0:
-                headers_all_rows.append(headers)
-
-        for row in rows:
-            content = _row_to_formated_cells(row, table_tag="td")
-            if len(content) > 0:
-                content_all_rows.append(content)
-
-        # if len(headers_all_rows) == 0 or len(content_all_rows) == 0:
-        #     return []
-
-        headers_all_rows = _regularise_table(headers_all_rows)
-        content_all_rows = _regularise_table(content_all_rows)
-
-        if len(headers_all_rows) == 0:
-            if len(content_all_rows) > 2:
-                headers_all_rows = content_all_rows[:2]
-                content_all_rows = content_all_rows[2:]
-            else:
-                return []
-
-        header_labels = []
-        for col_id in range(len(headers_all_rows[0])):
-            col_txt = "+".join([headers_all_rows[i][col_id]["name"] for i in range(len(headers_all_rows))])
-            if (len(header_labels) == 0) or (col_txt != header_labels[-1]):
-                header_labels.append(col_txt)
-
-        parsed_rows = []
-        for row in content_all_rows:
-            parsed_row = {}
-            for lbl, cell in zip(header_labels, row):
-                parsed_row[lbl] = cell["name"]
-            parsed_rows.append(parsed_row)
-
-        return parsed_rows
-    except Exception as e:
-        print(f"Failed to parse details table with error {e}")
-        return []
-
 def _join_labels(l1: str, l2: str) -> str:
     if l1 == l2:
         return l1
@@ -313,8 +486,87 @@ def _join_labels(l1: str, l2: str) -> str:
         return l1
     return f"{l1} & {l2}"
 
+def process_one_product(prod: t.Dict[str, t.Any]) -> t.Tuple[t.List, t.List]:
+    time.sleep(random.uniform(0,2))
+    link = prod["product_url"]
+    # print(link)
+    webtxt = download_website(link)
+    if webtxt is None:
+        print(f"   !!!! Failed to download {link} in product group {prod['product_group_url']}.  Skipping.")
+        return [], []
 
-if __name__ == '__main__':
+    if not prod["is_product"]:
+        rex_prods = []
+        if is_product_page(webpage=webtxt):
+            product_dict = {
+                "product_url": link,
+                "product_group": prod["product_group"] if "product_group" in prod else "NA",
+                "product_group_description": prod["product_group_description"] if "product_group_description" in prod else "",
+                "product_group_url": link,
+                "is_product": True
+            }
+            rex_prods.append(product_dict)
+        else:
+            rex_prods.extend(extract_products_from_product_groups(webpage=webtxt, web_url=link, base_url="https://www.best.cz/"))
+        for rp in rex_prods:
+            rp["category"] = prod["category"]
+            rp["category_description"] = prod["category_description"]
+            rp["category_url"] = prod["category_url"]
+            rp["prod_family"] = prod["prod_family"]
+            rp["prod_family_description"] = prod["prod_family_description"]
+            rp["prod_family_url"] = prod["prod_family_url"]
+            # rp["product_url"] = link
+            rp["product_group"] = _join_labels(prod["product_group"], rp["product_group"])
+            rp["product_group_description"] = _join_labels(prod["product_group_description"], rp["product_group_description"])
+            rp["product_group_url"] = link
+        return rex_prods, []
+    else:
+        try:
+            prod_details = extract_details_from_prod_page(webpage=webtxt, web_url=link)
+            if len(prod) == 0:
+                return [], []
+
+            prod["product_title"] = prod_details["product_title"]
+            prod["product_short_description"] = prod_details["product_short_description"]
+            prod["product_details_description"] = prod_details["product_details_description"]
+            prod["product_table_details"] = prod_details["product_table_details"]
+            prod["product_parameters"] = prod_details["product_parameters"]
+
+            summaries = get_product_summaries_and_tags(
+                prod_name=prod_details["product_title"],
+                short_desc=prod["product_short_description"],
+                long_desc=prod["product_details_description"],
+                table=prod["product_table_details"],
+                prod_group_desc=prod["product_group_description"],
+                prod_family_desc=prod["prod_family_description"],
+                category_desc=prod["category_description"]
+            )
+            prod["product_summary"] = summaries["product_summary"]
+            prod["product_summary_hierarchy"] = summaries["hierarchy_summary"]
+            prod["product_classifications"] = summaries["classifications"]
+            prod["product_param_colour"] = prod_details["product_parameters"]["BARVA"] if "BARVA" in prod_details["product_parameters"] else "NA"
+            prod["product_param_exterior"] = prod_details["product_parameters"]["POVRCH"] if "POVRCH" in prod_details["product_parameters"] else "NA"
+            prod["product_param_height"] = prod_details["product_parameters"]["VÝŠKA"] if "VÝŠKA" in prod_details["product_parameters"] else "NA"
+            prod["product_dimensions"] = summaries["dimensions"]
+
+
+            # prod["product_summary"] = _get_product_summary(product_title=prod["product_title"], short_desc=prod["product_short_description"], long_desc=prod["product_details_description"], table=prod["product_table_details"])
+            # prod["product_summary_hierarchy"] = _get_product_summary_with_hierarchy(
+            #     short_desc=prod["product_short_description"],
+            #     long_desc=prod["product_details_description"],
+            #     table=prod["product_table_details"],
+            #     prod_group_desc=prod["product_group_description"],
+            #     prod_family_desc=prod["prod_family_description"],
+            #     category_desc=prod["category_description"]
+            # )
+
+            return [], [prod]
+        except Exception as e:
+            print(f"   !!!! Failed to extract details for {link}. Skipping. {e}")
+            traceback.print_exc()
+            return [], []
+
+def main():
 
     categories_urls = [
         "https://www.best.cz/dlazby",
@@ -332,7 +584,7 @@ if __name__ == '__main__':
     for cat_url in tqdm.tqdm(categories_urls, desc="Getting product families in categories", ncols=100):
         webtxt = download_website(url=cat_url)
         if webtxt is None:
-            print(f"   !!!! Failed to download {cat_url}. Skipping.")
+            print(f"   !!!! Failed to download category {cat_url}. Skipping.")
             continue
         product_family = extract_links_from_category_page(webpage=webtxt, web_url=cat_url, base_url="https://www.best.cz/")
         all_prod_families.append(product_family)
@@ -344,7 +596,7 @@ if __name__ == '__main__':
         for link in pf["links"]:
             webtxt = download_website(link)
             if webtxt is None:
-                print(f"   !!!! Failed to download {pf['category_url']}. Skipping.")
+                print(f"   !!!! Failed to download {link} in product family {pf['category_url']}. Skipping.")
                 continue
             prod_group = extract_links_from_prod_family_page(webpage=webtxt, web_url=link, base_url="https://www.best.cz/")
             if len(prod_group) == 0:
@@ -356,12 +608,8 @@ if __name__ == '__main__':
             all_product_groups.append(prod_group)
 
     all_product_groups.sort(key=lambda x: x["prod_family_url"], reverse=True)
-    # for pg in all_product_groups:
-    #     print(f" >>> {pg}")
-
 
     all_products: t.List[t.Dict] = []
-
 
     for pg in tqdm.tqdm(all_product_groups, desc="Getting product sub-groups in product groups", ncols=100):
         pg_links = pg["prod_family_links"]
@@ -370,7 +618,7 @@ if __name__ == '__main__':
         for link in pg_links:
             webtxt = download_website(link)
             if webtxt is None:
-                print(f"   !!!! Failed to download {pg['prod_family_url']}. Skipping.")
+                print(f"   !!!! Failed to download {link} in product group {pg['prod_family_url']} . Skipping.")
                 continue
             if is_product_page(webpage=webtxt):
                 product_dict = {
@@ -400,54 +648,30 @@ if __name__ == '__main__':
     # }]
 
     finished_products = []
+    executor: futures.Executor = futures.ThreadPoolExecutor(max_workers=1000)
+
     while len(all_products) > 0:
         rexamine_products = []
         products_with_info = []
+        all_futures: t.List[futures.Future] = []
+        for prod in tqdm.tqdm(all_products, desc="Submitting all products", ncols=100):
+            all_futures.append(executor.submit(process_one_product, prod))
 
-        for prod in tqdm.tqdm(all_products, desc="Getting information about all products", ncols=100):
-            link = prod["product_url"]
-            # print(link)
-            webtxt = download_website(link)
-            if webtxt is None:
-                print(f"   !!!! Failed to download {link}. Skipping.")
-                continue
+        for finished_future in tqdm.tqdm(futures.as_completed(all_futures), total=len(all_futures), ncols=100, desc="Waiting for all product summaries to finish"):
+            reex_prods, prods = finished_future.result()
+            rexamine_products.extend(reex_prods)
+            products_with_info.extend(prods)
 
-            if not prod["is_product"]:
-                rex_prods = []
-                if is_product_page(webpage=webtxt):
-                    product_dict = {
-                        "product_url": link,
-                        "product_group": prod["product_group"] if "product_group" in prod else "NA",
-                        "product_group_description": prod["product_group_description"] if "product_group_description" in prod else "",
-                        "product_group_url": link,
-                        "is_product": True
-                    }
-                    rex_prods.append(product_dict)
-                else:
-                    rex_prods.extend(extract_products_from_product_groups(webpage=webtxt, web_url=link, base_url="https://www.best.cz/"))
-                for rp in rex_prods:
-                    rp["category"] = prod["category"]
-                    rp["category_description"] = prod["category_description"]
-                    rp["category_url"] = prod["category_url"]
-                    rp["prod_family"] = prod["prod_family"]
-                    rp["prod_family_description"] = prod["prod_family_description"]
-                    rp["prod_family_url"] = prod["prod_family_url"]
-                    # rp["product_url"] = link
-                    rp["product_group"] = _join_labels(prod["product_group"], rp["product_group"])
-                    rp["product_group_description"] = _join_labels(prod["product_group_description"], rp["product_group_description"])
-                    rp["product_group_url"] = link
-                rexamine_products.extend(rex_prods)
-            else:
-                prod_details = extract_details_from_prod_page(webpage=webtxt, web_url=link)
-                if len(prod) == 0:
-                    continue
+        # for prod in tqdm.tqdm(all_products, desc="Getting information about all products", ncols=100):
+        #     reex_prods, prods = process_one_product(prod)
+        #     rexamine_products.extend(reex_prods)
+        #     products_with_info.extend(prods)
 
-                prod["product_title"] = prod_details["product_title"]
-                prod["product_short_description"] = prod_details["product_short_description"]
-                prod["product_details_description"] = prod_details["product_details_description"]
-                prod["product_table_details"] = prod_details["product_table_details"]
-                products_with_info.append(prod)
         finished_products.extend(products_with_info)
         all_products = rexamine_products
 
     json.dump(finished_products, open("all_products.json", "w", encoding="utf-8"), ensure_ascii=False, sort_keys=True, indent=4)
+
+
+if __name__ == '__main__':
+    main()
