@@ -151,7 +151,10 @@ def show_subgroup(_, parent, namespace, query_fn):
         df = pd.DataFrame(
             {
                 "Distance": dists,
-                "Product": [f"[{m['name']}](https://best.cz)" for m in metas],
+                "Product": [
+                    f"[{m['name']}]({m['url']})" if "url" in m else f"{m['name']}"
+                    for m in metas
+                ],
                 "Select": ["__YES__" if s else "--" for s in select],
             }
         )

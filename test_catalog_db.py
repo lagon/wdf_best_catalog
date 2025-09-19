@@ -14,7 +14,7 @@ print(f"{categories=}")
 print(f"{prod_families=}")
 print(f"{prod_groups=}")
 print(f"{product=}")
-# print(f"{metas=}")
+print(f"{metas=}")
 
 # ---
 
