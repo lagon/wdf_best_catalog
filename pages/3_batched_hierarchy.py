@@ -183,11 +183,11 @@ def main():
     ) = query
     tabs = st.tabs(
         [
-            "__1\\. Category__",
-            "__2\\. Prod Family__",
-            "__3\\. Prod Group__",
-            "__4\\. Product__",
-            "__5\\. Matches__",
+            "__Category 1__",
+            "__Category 2__",
+            "__Category 3__",
+            "__Product__",
+            "__Matches__",
         ]
     )
     with tabs[0]:
