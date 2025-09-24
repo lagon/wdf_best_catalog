@@ -124,7 +124,7 @@ class OAI_Batch():
                         "error_file_id": batch_info.error_file_id
                     })
                     os.remove(fn)
-                elif batch_info.status in ["failed", "expired", "canceled"]:
+                elif batch_info.status in ["failed", "expired", "cancelled", "cancelling"]:
                     self.add_work_items([batch["work_item"]])
                     os.remove(fn)
                 elif batch_info.status in ["in_progress"]:
