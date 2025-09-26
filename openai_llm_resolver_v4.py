@@ -126,8 +126,10 @@ The output is a JSON. First, the output indicates whether you have found:
  * product does not fit into any category and is outside of the scope of products in the catalogue (indicated by value 'NO_MATCH').
  
 Secondly, output the list of matching categories (indicated by CATEGORY LABEL above) with probability that requested product belongs into given category. 
-In all cases output only appropriate categories and if there are none the result is empty list. The structure of the json
-must follow the example below:
+In all cases output only appropriate categories and if there are none the result is empty list. 
+Allowed values for LABEL field below are: {OPTION_LABELS}.
+
+The structure of the json must follow the example below.
 {{
     'result': 'SINGLE_FOUND_MATCH',
     'selections': [
@@ -215,7 +217,9 @@ The output is a JSON. First, the output indicates whether you have found:
 
 Secondly, output the list of matching product families indicated by corresponding PRODUCT FAMILY LABEL with probability that requested
 product belongs into given product family. In all cases output only appropriate product families and if there are none
-the result is empty list. The structure of the json must follow the example below:
+the result is empty list. Allowed values for LABEL field below are: {OPTION_LABELS}. 
+
+The structure of the json must follow the example below:
 {{
     'result': 'SINGLE_FOUND_MATCH',
     'selections': [
@@ -305,8 +309,8 @@ The output is a JSON. First, the output indicates whether you have found:
  * product does not fit into any product group and is outside of the scope of products in the catalogue (indicated by value 'NO_MATCH').
 
 Secondly, output the list of matching product groups indicated by PRODUCT GROUP LABEL with probability that requested product belongs into given product group. 
-In all cases output only appropriate product groups and if there are none the result is empty list. The structure of the json
-must follow the example below:
+In all cases output only appropriate product groups and if there are none the result is empty list. Allowed values for LABEL field below are: {OPTION_LABELS}.
+The structure of the json must follow the example below:
 {{
     'result': 'SINGLE_FOUND_MATCH',
     'selections': [
@@ -402,6 +406,8 @@ The output is a JSON. First, the output indicates whether you have found:
  * multiple products match the description (indicated by value 'MULTIPLE_MATCHES'), 
  * or there is no match what so ever (indicated by value 'NO_MATCH') and we should try different product groups.
 Secondly, output the list of all above products indicated by PRODUCT LABEL with probability that requested product matches the offered product.
+Allowed values for LABEL field below are: {OPTION_LABELS}. 
+
 The structure of the json must follow the example below:
 {{
     'result': 'SINGLE_FOUND_MATCH',
@@ -588,6 +594,7 @@ class ProductResolutionWorkItem(oai_batch.WorkItem):
                 "PRODUCT FAMILY": self.value_or_empty_str(self._data["PRODUCT FAMILY"], "PRODUCT FAMILY SELECTION"),
                 "PRODUCT GROUP": self.value_or_empty_str(self._data["PRODUCT GROUP"], "PRODUCT GROUP SELECTION"),
             }, state=self._data["STATE"], product_db=self._product_db)
+            instructions_data["OPTION_LABELS"] = "; ".join([f"""'{opt}'""" for opt in option_ids_to_choose_from])
             instruction_str = instruction_str.format(OPTIONS_DESCRIPTION=selection_texts, **instructions_data)
             prompt_str = prompt_str.format(CUSTOMER_DESCRIPTION=self._data["CUSTOMER DESC"] ,EXPANDED_DESCRIPTION=self._data["EXTENDED DESC"])
 
@@ -664,6 +671,20 @@ class ResponseType(enum.Enum):
     los = ListOfSelections
     ljr = LlmJudgeResult
 
+def _do_additional_data_structure(last_selected: str, state: str, final_output: str, customer_desc: str, extended_desc: str, req_col: str, category_data: t.Dict, prod_fam_data: t.Dict, prod_grp_data: t.Dict, product_data: t.Dict) -> t.Dict[str, t.Union[str, t.Dict]]:
+    return {
+        "LAST SELECTED": last_selected,
+        "STATE": state,
+        "FINAL OUTPUT": final_output,
+        "CUSTOMER DESC": customer_desc,
+        "EXTENDED DESC": extended_desc,
+        "REQ COLOUR": req_col,
+        "CATEGORY": category_data,
+        "PRODUCT FAMILY": prod_fam_data,
+        "PRODUCT GROUP": prod_grp_data,
+        "PRODUCT": product_data
+    }
+
 def expand_customer_requested_product(request_offer_list: t.List[t.Dict], batch: oai_batch.OAI_Batch, desc_expansion_model_name: str, work_dir: str) -> t.List[t.Dict]:
     desc_expansion_work_items: t.List[ExtendCustomerDescriptionSumWorkItem] = []
 
@@ -682,43 +703,23 @@ def expand_customer_requested_product(request_offer_list: t.List[t.Dict], batch:
     batch.add_work_items(desc_expansion_work_items)
     batch.run_loop()
 
-    return [wi.get_responses() for wi in desc_expansion_work_items]
-
-def _do_additional_data_structure(last_selected: str, state: str, final_output: str, customer_desc: str, extended_desc: str, req_col: str, category_data: t.Dict, prod_fam_data: t.Dict, prod_grp_data: t.Dict, product_data: t.Dict) -> t.Dict[str, t.Union[str, t.Dict]]:
-    return {
-            "LAST SELECTED": last_selected,
-            "STATE": state,
-            "FINAL OUTPUT": final_output,
-            "CUSTOMER DESC": customer_desc,
-            "EXTENDED DESC": extended_desc,
-            "REQ COLOUR": req_col,
-            "CATEGORY": category_data,
-            "PRODUCT FAMILY": prod_fam_data,
-            "PRODUCT GROUP": prod_grp_data,
-            "PRODUCT": product_data
-        }
-
-def resolve_category(desc_expanded_list: t.List[t.Dict[str, t.Any]], batch: oai_batch.OAI_Batch, product_db: t.Dict[str, t.Any], base_llm_name: str, work_dir: str) -> t.List[t.Dict]:
-    category_resolution_work_items: t.List[ProductResolutionWorkItem] = []
-    for dewi in desc_expanded_list:
-        additional_data = _do_additional_data_structure(
+    output = []
+    for work_item in desc_expansion_work_items:
+        wi = work_item.get_responses()
+        add_data = _do_additional_data_structure(
             last_selected="NA",
             state="CATEGORY",
-            final_output=dewi["additional_data"]["FINAL OUTPUT"],
-            customer_desc=dewi["additional_data"]["CUSTOMER DESC"],
-            extended_desc=dewi["extend_description"],
-            req_col=dewi["colour_id"],
+            final_output=wi["additional_data"]["FINAL OUTPUT"],
+            customer_desc=wi["additional_data"]["CUSTOMER DESC"],
+            extended_desc=wi["extend_description"],
+            req_col=wi["colour_id"],
             category_data={},
             prod_fam_data={},
             prod_grp_data={},
             product_data={}
         )
-        category_resolution_work_items.append(ProductResolutionWorkItem(data=additional_data, model_name=base_llm_name, work_dir=work_dir, product_db=product_db))
-
-    batch.add_work_items(category_resolution_work_items)
-    batch.run_loop()
-
-    return [wi.get_responses() for wi in category_resolution_work_items]
+        output.append(add_data)
+    return output
 
 def _update_final_product_selection(wi_data: t.Dict[str, t.Any], final_product_selection: t.Dict[str, t.List[t.Dict]]):
     title = wi_data["CUSTOMER DESC"]
@@ -726,24 +727,31 @@ def _update_final_product_selection(wi_data: t.Dict[str, t.Any], final_product_s
         final_product_selection[title] = []
     final_product_selection[title].append(wi_data.copy())
 
+def resolve_category(desc_expanded_list: t.List[t.Dict[str, t.Any]], final_product_selection: t.Dict[str, t.List[t.Dict]], batch: oai_batch.OAI_Batch, product_db: t.Dict[str, t.Any], base_llm_name: str, work_dir: str) -> t.List[t.Dict]:
+    category_resolution_work_items: t.List[ProductResolutionWorkItem] = []
+    for dewi in desc_expanded_list:
+        category_resolution_work_items.append(ProductResolutionWorkItem(data=dewi, model_name=base_llm_name, work_dir=work_dir, product_db=product_db))
 
-def resolve_product_families(categories_list: t.List[t.Dict[str, t.Any]], final_product_selection: t.Dict[str, t.List[t.Dict]], batch: oai_batch.OAI_Batch, product_db: t.Dict[str, t.Any], base_llm_name: str, work_dir: str) -> t.List[t.Dict[str, t.Any]]:
-    prod_family_resolution_work_items: t.List[ProductResolutionWorkItem] = []
-    for cat_sel_dta in categories_list:
-        if len(cat_sel_dta["selection"]["selections"]) == 0:
+    batch.add_work_items(category_resolution_work_items)
+    batch.run_loop()
+
+    output = []
+    for work_item in category_resolution_work_items:
+        wi = work_item.get_responses()
+        if len(wi["selection"]["selections"]) == 0:
             wi_data=_do_additional_data_structure(
                 last_selected="",
-                state="PRODUCTGROUP",
-                final_output=cat_sel_dta["additional_data"]["FINAL OUTPUT"],
-                customer_desc=cat_sel_dta["additional_data"]["CUSTOMER DESC"],
-                extended_desc=cat_sel_dta["additional_data"]["EXTENDED DESC"],
-                req_col=cat_sel_dta["additional_data"]["REQ COLOUR"],
+                state="PRODUCTFAMILY",
+                final_output=wi["additional_data"]["FINAL OUTPUT"],
+                customer_desc=wi["additional_data"]["CUSTOMER DESC"],
+                extended_desc=wi["additional_data"]["EXTENDED DESC"],
+                req_col=wi["additional_data"]["REQ COLOUR"],
                 category_data= {
-                    "CATEGORY ALL SELECTIONS": cat_sel_dta["selection"],
+                    "CATEGORY ALL SELECTIONS": wi["selection"],
                     "CATEGORY SELECTION": "",
                     "CATEGORY SELECTION PROB": 0.0,
-                    "CATEGORY INSTRUCTIONS": cat_sel_dta["additional_data"]["INSTRUCTIONS CATEGORY"],
-                    "CATEGORY PROMPT": cat_sel_dta["additional_data"]["PROMPT CATEGORY"],
+                    "CATEGORY INSTRUCTIONS": wi["additional_data"]["INSTRUCTIONS CATEGORY"],
+                    "CATEGORY PROMPT": wi["additional_data"]["PROMPT CATEGORY"],
                 },
                 prod_fam_data={},
                 prod_grp_data={},
@@ -751,151 +759,179 @@ def resolve_product_families(categories_list: t.List[t.Dict[str, t.Any]], final_
             )
             _update_final_product_selection(wi_data=wi_data, final_product_selection=final_product_selection)
             continue
-
-        for sel in cat_sel_dta["selection"]["selections"]:
-            wi_data = _do_additional_data_structure(
-                last_selected=sel["LABEL"],
-                state="PRODUCTFAMILY",
-                final_output=cat_sel_dta["additional_data"]["FINAL OUTPUT"],
-                customer_desc=cat_sel_dta["additional_data"]["CUSTOMER DESC"],
-                extended_desc=cat_sel_dta["additional_data"]["EXTENDED DESC"],
-                req_col=cat_sel_dta["additional_data"]["REQ COLOUR"],
-                category_data= {
-                    "CATEGORY ALL SELECTIONS": cat_sel_dta["selection"],
-                    "CATEGORY SELECTION": sel["LABEL"],
-                    "CATEGORY SELECTION PROB": sel["PROBABILITY"],
-                    "CATEGORY INSTRUCTIONS": cat_sel_dta["additional_data"]["INSTRUCTIONS CATEGORY"],
-                    "CATEGORY PROMPT": cat_sel_dta["additional_data"]["PROMPT CATEGORY"],
-                },
-                prod_fam_data={},
-                prod_grp_data={},
-                product_data={}
-            )
-            if sel["PROBABILITY"] > 0.01:
-                prod_family_resolution_work_items.append(
-                    ProductResolutionWorkItem(data=wi_data, model_name=base_llm_name, work_dir=work_dir, product_db=product_db)
+        else:
+            for sel in wi["selection"]["selections"]:
+                wi_data = _do_additional_data_structure(
+                    last_selected=sel["LABEL"],
+                    state="PRODUCTFAMILY",
+                    final_output=wi["additional_data"]["FINAL OUTPUT"],
+                    customer_desc=wi["additional_data"]["CUSTOMER DESC"],
+                    extended_desc=wi["additional_data"]["EXTENDED DESC"],
+                    req_col=wi["additional_data"]["REQ COLOUR"],
+                    category_data= {
+                        "CATEGORY ALL SELECTIONS": wi["selection"],
+                        "CATEGORY SELECTION": sel["LABEL"],
+                        "CATEGORY SELECTION PROB": sel["PROBABILITY"],
+                        "CATEGORY INSTRUCTIONS": wi["additional_data"]["INSTRUCTIONS CATEGORY"],
+                        "CATEGORY PROMPT": wi["additional_data"]["PROMPT CATEGORY"],
+                    },
+                    prod_fam_data={},
+                    prod_grp_data={},
+                    product_data={}
                 )
-            else:
-                _update_final_product_selection(wi_data=wi_data, final_product_selection=final_product_selection)
+                if sel["PROBABILITY"] > 0.01:
+                    output.append(wi_data)
+                else:
+                    _update_final_product_selection(wi_data=wi_data, final_product_selection=final_product_selection)
+        return output
 
+def resolve_product_families(categories_list: t.List[t.Dict[str, t.Any]], final_product_selection: t.Dict[str, t.List[t.Dict]], batch: oai_batch.OAI_Batch, product_db: t.Dict[str, t.Any], base_llm_name: str, work_dir: str) -> t.List[t.Dict[str, t.Any]]:
+    prod_family_resolution_work_items: t.List[ProductResolutionWorkItem] = []
+    for pf_wi in categories_list:
+        prod_family_resolution_work_items.append(ProductResolutionWorkItem(data=pf_wi, model_name=base_llm_name, work_dir=work_dir, product_db=product_db))
 
     batch.add_work_items(prod_family_resolution_work_items)
     batch.run_loop()
 
-    return [wi.get_responses() for wi in prod_family_resolution_work_items]
-
-def resolve_product_groups(product_families_list: t.List[t.Dict[str, t.Any]], final_product_selection: t.Dict[str, t.List[t.Dict]], batch: oai_batch.OAI_Batch, product_db: t.Dict[str, t.Any], base_llm_name: str, work_dir: str) -> t.List[t.Dict[str, t.Any]]:
-    prod_group_resolution_work_items: t.List[ProductResolutionWorkItem] = []
-    for pf_sel_dta in product_families_list:
-        if len(pf_sel_dta["selection"]["selections"]) == 0:
+    output = []
+    for work_item in prod_family_resolution_work_items:
+        wi = work_item.get_responses()
+        if len(wi["selection"]["selections"]) == 0:
             wi_data=_do_additional_data_structure(
                 last_selected="",
                 state="PRODUCTGROUP",
-                final_output=pf_sel_dta["additional_data"]["FINAL OUTPUT"],
-                customer_desc=pf_sel_dta["additional_data"]["CUSTOMER DESC"],
-                extended_desc=pf_sel_dta["additional_data"]["EXTENDED DESC"],
-                req_col=pf_sel_dta["additional_data"]["REQ COLOUR"],
-                category_data=pf_sel_dta["additional_data"]["CATEGORY"].copy(),
+                final_output=wi["additional_data"]["FINAL OUTPUT"],
+                customer_desc=wi["additional_data"]["CUSTOMER DESC"],
+                extended_desc=wi["additional_data"]["EXTENDED DESC"],
+                req_col=wi["additional_data"]["REQ COLOUR"],
+                category_data=wi["additional_data"]["CATEGORY"].copy(),
                 prod_fam_data={
-                    "PRODUCT FAMILY ALL SELECTIONS": pf_sel_dta["selection"],
+                    "PRODUCT FAMILY ALL SELECTIONS": wi["selection"],
                     "PRODUCT FAMILY SELECTION": "",
                     "PRODUCT FAMILY SELECTION PROB": 0.0,
-                    "PRODUCT FAMILY INSTRUCTIONS": pf_sel_dta["additional_data"]["INSTRUCTIONS PRODUCTFAMILY"],
-                    "PRODUCT FAMILY PROMPT": pf_sel_dta["additional_data"]["PROMPT PRODUCTFAMILY"],
+                    "PRODUCT FAMILY INSTRUCTIONS": wi["additional_data"]["INSTRUCTIONS PRODUCTFAMILY"],
+                    "PRODUCT FAMILY PROMPT": wi["additional_data"]["PROMPT PRODUCTFAMILY"],
                 },
                 prod_grp_data={},
                 product_data={}
             )
             _update_final_product_selection(wi_data=wi_data, final_product_selection=final_product_selection)
-            continue
-
-        for sel in pf_sel_dta["selection"]["selections"]:
-            wi_data=_do_additional_data_structure(
-                last_selected=sel["LABEL"],
-                state="PRODUCTGROUP",
-                final_output=pf_sel_dta["additional_data"]["FINAL OUTPUT"],
-                customer_desc=pf_sel_dta["additional_data"]["CUSTOMER DESC"],
-                extended_desc=pf_sel_dta["additional_data"]["EXTENDED DESC"],
-                req_col=pf_sel_dta["additional_data"]["REQ COLOUR"],
-                category_data=pf_sel_dta["additional_data"]["CATEGORY"].copy(),
-                prod_fam_data={
-                    "PRODUCT FAMILY ALL SELECTIONS": pf_sel_dta["selection"],
-                    "PRODUCT FAMILY SELECTION": sel["LABEL"],
-                    "PRODUCT FAMILY SELECTION PROB": sel["PROBABILITY"],
-                    "PRODUCT FAMILY INSTRUCTIONS": pf_sel_dta["additional_data"]["INSTRUCTIONS PRODUCTFAMILY"],
-                    "PRODUCT FAMILY PROMPT": pf_sel_dta["additional_data"]["PROMPT PRODUCTFAMILY"],
-                },
-                prod_grp_data={},
-                product_data={}
-            )
-            if sel["PROBABILITY"] > 0.01:
-                prod_group_resolution_work_items.append(
-                    ProductResolutionWorkItem(data=wi_data, model_name=base_llm_name, work_dir=work_dir, product_db=product_db)
+        else:
+            for sel in wi["selection"]["selections"]:
+                wi_data=_do_additional_data_structure(
+                    last_selected=sel["LABEL"],
+                    state="PRODUCTGROUP",
+                    final_output=wi["additional_data"]["FINAL OUTPUT"],
+                    customer_desc=wi["additional_data"]["CUSTOMER DESC"],
+                    extended_desc=wi["additional_data"]["EXTENDED DESC"],
+                    req_col=wi["additional_data"]["REQ COLOUR"],
+                    category_data=wi["additional_data"]["CATEGORY"].copy(),
+                    prod_fam_data={
+                        "PRODUCT FAMILY ALL SELECTIONS": wi["selection"],
+                        "PRODUCT FAMILY SELECTION": sel["LABEL"],
+                        "PRODUCT FAMILY SELECTION PROB": sel["PROBABILITY"],
+                        "PRODUCT FAMILY INSTRUCTIONS": wi["additional_data"]["INSTRUCTIONS PRODUCTFAMILY"],
+                        "PRODUCT FAMILY PROMPT": wi["additional_data"]["PROMPT PRODUCTFAMILY"],
+                    },
+                    prod_grp_data={},
+                    product_data={}
                 )
-            else:
-                _update_final_product_selection(wi_data=wi_data, final_product_selection=final_product_selection)
+                if sel["PROBABILITY"] > 0.01:
+                    output.append(wi_data)
+                else:
+                    _update_final_product_selection(wi_data=wi_data, final_product_selection=final_product_selection)
+
+    return output
+
+def resolve_product_groups(product_families_list: t.List[t.Dict[str, t.Any]], final_product_selection: t.Dict[str, t.List[t.Dict]], batch: oai_batch.OAI_Batch, product_db: t.Dict[str, t.Any], base_llm_name: str, work_dir: str) -> t.List[t.Dict[str, t.Any]]:
+    prod_group_resolution_work_items = []
+    for pg_wi in product_families_list:
+        prod_group_resolution_work_items.append(ProductResolutionWorkItem(data=pg_wi, model_name=base_llm_name, product_db=product_db, work_dir=work_dir))
 
     batch.add_work_items(prod_group_resolution_work_items)
     batch.run_loop()
 
-    return [wi.get_responses() for wi in prod_group_resolution_work_items]
-
-def resolve_products(product_groups_list: t.List[t.Dict[str, t.Any]], final_product_selection: t.Dict[str, t.List[t.Dict]], batch: oai_batch.OAI_Batch, product_db: t.Dict[str, t.Any], base_llm_name: str, work_dir: str) -> t.List[t.Dict[str, t.Any]]:
-    product_resolution_work_items: t.List[ProductResolutionWorkItem] = []
-    for pg_sel_dta in product_groups_list:
-        if len(pg_sel_dta["selection"]["selections"]) == 0:
+    output = []
+    for work_item in prod_group_resolution_work_items:
+        wi = work_item.get_responses()
+        if len(wi["selection"]["selections"]) == 0:
             wi_data = _do_additional_data_structure(
                 last_selected="",
                 state="PRODUCT",
-                final_output=pg_sel_dta["additional_data"]["FINAL OUTPUT"],
-                customer_desc=pg_sel_dta["additional_data"]["CUSTOMER DESC"],
-                extended_desc=pg_sel_dta["additional_data"]["EXTENDED DESC"],
-                req_col=pg_sel_dta["additional_data"]["REQ COLOUR"],
-                category_data=pg_sel_dta["additional_data"]["CATEGORY"].copy(),
-                prod_fam_data=pg_sel_dta["additional_data"]["PRODUCT FAMILY"].copy(),
+                final_output=wi["additional_data"]["FINAL OUTPUT"],
+                customer_desc=wi["additional_data"]["CUSTOMER DESC"],
+                extended_desc=wi["additional_data"]["EXTENDED DESC"],
+                req_col=wi["additional_data"]["REQ COLOUR"],
+                category_data=wi["additional_data"]["CATEGORY"].copy(),
+                prod_fam_data=wi["additional_data"]["PRODUCT FAMILY"].copy(),
                 prod_grp_data={
-                    "PRODUCT GROUP ALL SELECTIONS": pg_sel_dta["selection"],
+                    "PRODUCT GROUP ALL SELECTIONS": wi["selection"],
                     "PRODUCT GROUP SELECTION": "",
                     "PRODUCT GROUP SELECTION PROB": 0.0,
-                    "PRODUCT GROUP INSTRUCTIONS": pg_sel_dta["additional_data"]["INSTRUCTIONS PRODUCTGROUP"],
-                    "PRODUCT GROUP PROMPT": pg_sel_dta["additional_data"]["PROMPT PRODUCTGROUP"]
+                    "PRODUCT GROUP INSTRUCTIONS": wi["additional_data"]["INSTRUCTIONS PRODUCTGROUP"],
+                    "PRODUCT GROUP PROMPT": wi["additional_data"]["PROMPT PRODUCTGROUP"]
                 },
                 product_data={}
             )
             _update_final_product_selection(wi_data=wi_data, final_product_selection=final_product_selection)
-            continue
-
-        for sel in pg_sel_dta["selection"]["selections"]:
-            wi_data = _do_additional_data_structure(
-                last_selected=sel["LABEL"],
-                state="PRODUCT",
-                final_output=pg_sel_dta["additional_data"]["FINAL OUTPUT"],
-                customer_desc=pg_sel_dta["additional_data"]["CUSTOMER DESC"],
-                extended_desc=pg_sel_dta["additional_data"]["EXTENDED DESC"],
-                req_col=pg_sel_dta["additional_data"]["REQ COLOUR"],
-                category_data=pg_sel_dta["additional_data"]["CATEGORY"].copy(),
-                prod_fam_data=pg_sel_dta["additional_data"]["PRODUCT FAMILY"].copy(),
-                prod_grp_data={
-                    "PRODUCT GROUP ALL SELECTIONS": pg_sel_dta["selection"],
-                    "PRODUCT GROUP SELECTION": sel["LABEL"],
-                    "PRODUCT GROUP SELECTION PROB": sel["PROBABILITY"],
-                    "PRODUCT GROUP INSTRUCTIONS": pg_sel_dta["additional_data"]["INSTRUCTIONS PRODUCTGROUP"],
-                    "PRODUCT GROUP PROMPT": pg_sel_dta["additional_data"]["PROMPT PRODUCTGROUP"]
-                },
-                product_data={}
-            )
-
-            if sel["PROBABILITY"] > 0.01:
-                product_resolution_work_items.append(
-                    ProductResolutionWorkItem(data=wi_data, model_name=base_llm_name, work_dir=work_dir, product_db=product_db)
+        else:
+            for sel in wi["selection"]["selections"]:
+                wi_data = _do_additional_data_structure(
+                    last_selected=sel["LABEL"],
+                    state="PRODUCT",
+                    final_output=wi["additional_data"]["FINAL OUTPUT"],
+                    customer_desc=wi["additional_data"]["CUSTOMER DESC"],
+                    extended_desc=wi["additional_data"]["EXTENDED DESC"],
+                    req_col=wi["additional_data"]["REQ COLOUR"],
+                    category_data=wi["additional_data"]["CATEGORY"].copy(),
+                    prod_fam_data=wi["additional_data"]["PRODUCT FAMILY"].copy(),
+                    prod_grp_data={
+                        "PRODUCT GROUP ALL SELECTIONS": wi["selection"],
+                        "PRODUCT GROUP SELECTION": sel["LABEL"],
+                        "PRODUCT GROUP SELECTION PROB": sel["PROBABILITY"],
+                        "PRODUCT GROUP INSTRUCTIONS": wi["additional_data"]["INSTRUCTIONS PRODUCTGROUP"],
+                        "PRODUCT GROUP PROMPT": wi["additional_data"]["PROMPT PRODUCTGROUP"]
+                    },
+                    product_data={}
                 )
-            else:
-                _update_final_product_selection(wi_data=wi_data, final_product_selection=final_product_selection)
 
+                if sel["PROBABILITY"] > 0.01:
+                    output.append(wi_data)
+                else:
+                    _update_final_product_selection(wi_data=wi_data, final_product_selection=final_product_selection)
+    return output
+
+def resolve_products(product_groups_list: t.List[t.Dict[str, t.Any]], final_product_selection: t.Dict[str, t.List[t.Dict]], batch: oai_batch.OAI_Batch, product_db: t.Dict[str, t.Any], base_llm_name: str, work_dir: str) -> t.List[t.Dict[str, t.Any]]:
+    product_resolution_work_items: t.List[ProductResolutionWorkItem] = []
+    for prod_wi in product_groups_list:
+        product_resolution_work_items.append(ProductResolutionWorkItem(data=prod_wi, model_name=base_llm_name, product_db=product_db, work_dir=work_dir))
 
     batch.add_work_items(product_resolution_work_items)
     batch.run_loop()
-    return [wi.get_responses() for wi in product_resolution_work_items]
+
+    for work_dir in product_resolution_work_items:
+        wi = work_dir.get_responses()
+        wi_data = _do_additional_data_structure(
+            last_selected="",
+            state="FINAL PRODUCT SELECTION",
+            final_output=wi["additional_data"]["FINAL OUTPUT"],
+            customer_desc=wi["additional_data"]["CUSTOMER DESC"],
+            extended_desc=wi["additional_data"]["EXTENDED DESC"],
+            req_col=wi["additional_data"]["REQ COLOUR"],
+            category_data=wi["additional_data"]["CATEGORY"].copy(),
+            prod_fam_data=wi["additional_data"]["PRODUCT FAMILY"].copy(),
+            prod_grp_data=wi["additional_data"]["PRODUCT GROUP"].copy(),
+            product_data= {
+                "PRODUCT ALL SELECTIONS": wi["selection"],
+                # "PRODUCT SELECTION": sel["LABEL"],
+                # "PRODUCT SELECTION PROB": sel["PROBABILITY"],
+                "PRODUCT INSTRUCTIONS": wi["additional_data"]["INSTRUCTIONS PRODUCT"],
+                "PRODUCT PROMPT": wi["additional_data"]["PROMPT PRODUCT"],
+            }
+        )
+        _update_final_product_selection(wi_data=wi_data, final_product_selection=final_product_selection)
+
+    return []
 
 
 def main():
@@ -969,8 +1005,8 @@ def main():
     all_outputs_list = []
     client: oai.OpenAI = oai.OpenAI(api_key=os.environ.get("OPEN_AI_API_KEY"))
     work_dir: str = "/home/cepekmir/Sources/wdf_best_catalog/tmp/expand_description/"
-    desc_expansion_model_name = "gpt-4.1-mini"
-    base_llm_name = "gpt-4.1-mini"
+    desc_expansion_model_name = "gpt-5-nano"
+    base_llm_name = "gpt-5-nano"
     # desc_expansion_model_name = "gpt-4.1-mini"
     # base_llm_name = "gpt-4.1-mini"
     batch: oai_batch.OAI_Batch = oai_batch.OAI_Batch(client=client, working_dir=work_dir, return_work_items=False, max_work_items_to_add=100, number_active_batches=100)
@@ -978,31 +1014,10 @@ def main():
     final_product_selection: t.Dict[str, t.List[t.Dict[str, t.Any]]] = {}
 
     desc_expansion: t.List[t.Dict] = expand_customer_requested_product(request_offer_list=request_offer_list, batch=batch, desc_expansion_model_name=desc_expansion_model_name, work_dir=work_dir)
-    category_selection: t.List[t.Dict] = resolve_category(desc_expanded_list=desc_expansion, batch=batch, product_db=product_indices, base_llm_name=base_llm_name, work_dir=work_dir)
+    category_selection: t.List[t.Dict] = resolve_category(desc_expanded_list=desc_expansion, final_product_selection=final_product_selection, batch=batch, product_db=product_indices, base_llm_name=base_llm_name, work_dir=work_dir)
     product_families_selection: t.List[t.Dict[str, t.Any]] = resolve_product_families(categories_list=category_selection, final_product_selection=final_product_selection, batch=batch, product_db=product_indices, base_llm_name=base_llm_name, work_dir=work_dir)
     product_groups_selection: t.List[t.Dict[str, t.Any]] = resolve_product_groups(product_families_list=product_families_selection, final_product_selection=final_product_selection, batch=batch, product_db=product_indices, base_llm_name=base_llm_name, work_dir=work_dir)
     product_selection: t.List[t.Dict[str, t.Any]] = resolve_products(product_groups_list=product_groups_selection, final_product_selection=final_product_selection, batch=batch, product_db=product_indices, base_llm_name=base_llm_name, work_dir=work_dir)
-
-    for prod_sel_dta in product_selection:
-        wi_data = _do_additional_data_structure(
-            last_selected="",
-            state="FINAL PRODUCT SELECTION",
-            final_output=prod_sel_dta["additional_data"]["FINAL OUTPUT"],
-            customer_desc=prod_sel_dta["additional_data"]["CUSTOMER DESC"],
-            extended_desc=prod_sel_dta["additional_data"]["EXTENDED DESC"],
-            req_col=prod_sel_dta["additional_data"]["REQ COLOUR"],
-            category_data=prod_sel_dta["additional_data"]["CATEGORY"].copy(),
-            prod_fam_data=prod_sel_dta["additional_data"]["PRODUCT FAMILY"].copy(),
-            prod_grp_data=prod_sel_dta["additional_data"]["PRODUCT GROUP"].copy(),
-            product_data= {
-                "PRODUCT ALL SELECTIONS": prod_sel_dta["selection"],
-                # "PRODUCT SELECTION": sel["LABEL"],
-                # "PRODUCT SELECTION PROB": sel["PROBABILITY"],
-                "PRODUCT INSTRUCTIONS": prod_sel_dta["additional_data"]["INSTRUCTIONS PRODUCT"],
-                "PRODUCT PROMPT": prod_sel_dta["additional_data"]["PROMPT PRODUCT"],
-            }
-        )
-        _update_final_product_selection(wi_data=wi_data, final_product_selection=final_product_selection)
 
     with open(os.path.join(work_dir, "final_product_selection.json"), "wt", encoding="utf-8") as f:
         json.dump(final_product_selection, f, ensure_ascii=False, indent=4)
