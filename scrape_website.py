@@ -20,6 +20,7 @@ import tqdm
 import openai as oai
 from resources.template_codes import TEMPLATE_CODES
 
+import config.configuration as cfg
 
 class ProductDim(pyd.BaseModel):
     height: int
@@ -45,11 +46,12 @@ def make_batch(client: oai.OpenAI, batch_input: t.List[t.Dict]) -> str:
     )
     return batch.id
 
-def product_web_extraction_prompts(model_name: str, product_detail_desc: str) -> t.List:
+def product_web_extraction_prompts(product_detail_desc: str) -> t.List:
     """
     Create a batch job with two requests (description extraction + table extraction).
     Returns the batch id.
     """
+    model_name = cfg.get_settings().product_web_extraction_model_name
     batch_input = [
         {
             "custom_id": "description",
@@ -151,21 +153,20 @@ def extract_text_description_and_table(product_title: str, product_detail_desc: 
     """
     # Cache filename
     fname = os.path.join(
-        "/home/cepekmir/Sources/wdf_best_catalog/tmp",
+        cfg.get_settings().product_details_request_cache_dir,
         f"content-{hashlib.md5(";;;".join([product_title, product_detail_desc]).encode()).hexdigest()}.json"
     )
-
-    model_name = "gpt-4.1-mini"
-    client = oai.OpenAI(api_key=os.environ.get("OPEN_AI_API_KEY"))
-
     # Return from cache if available
     if os.path.isfile(fname):
         with open(fname, "rt", encoding="utf-8") as f:
             cont = json.load(f)
+            if ("description" not in cont) or ("table" not in cont):
+                print("XXXX")
             return cont["description"], cont["table"]
 
+    client = oai.OpenAI(api_key=cfg.get_settings().open_ai_api_key)
     # Run batch with retry
-    batch_data = product_web_extraction_prompts(model_name=model_name, product_detail_desc=product_detail_desc)
+    batch_data = product_web_extraction_prompts(product_detail_desc=product_detail_desc)
     batch_res = run_batch_with_retry(client=client, batch_data=batch_data, max_batch_retries=3, batch_poll_interval_secs=10)
     if batch_res is None:
         return None
@@ -176,8 +177,7 @@ def extract_text_description_and_table(product_title: str, product_detail_desc: 
 
     return batch_res["description"], batch_res["table"]
 
-def summary_batch_requests(model_name: str,
-                           product_name: str,
+def summary_batch_requests(product_name: str,
                            short_desc: str,
                            long_desc: str,
                            table: str,
@@ -188,6 +188,7 @@ def summary_batch_requests(model_name: str,
     Create a batch job with two requests (description extraction + table extraction).
     Returns the batch id.
     """
+    model_name = cfg.get_settings().product_summary_extraction_model_name
     batch_input = [
         {
             "custom_id": "product_summary",
@@ -211,31 +212,31 @@ Keep all replies in Czech language."""},
                 ],
             },
         },
-        {
-            "custom_id": "hierarchy_summary",
-            "method": "POST",
-            "url": "/v1/responses",
-            "body": {
-                "model": model_name,
-                "input": [
-                    {"role": "developer", "content": """Your task is summarise a description of a building product made of pressed concrete.
-The summary must capture the intended use (garden, home, public roads) and purpose, essential characteristics like  dimensions and colour. 
-If the description captures different flavours of the product, mention them all in the summary. The text will be later used to match 
-products to items enquired by a potential customer. Customer enquires are fuzzy and can be misaligned. So keep all relevant details 
-in the description. The product description is in czech and consists of four elements: product name, short description (marketing paragraph), longer
-description (more technical description) and table with dimensions and details in row order. In addition you get also all the descriptions
-from product hierarchy - from the top, category (most general set of products), product family and product group (lowest level).  Keep all replies in Czech language."""},
-                    {"role": "user", "content": f"Product name: {product_name}"},
-                    {"role": "user", "content": f"Short description marketing headline description: {short_desc}"},
-                    {"role": "user", "content": f"Longer, more technical description: {long_desc}"},
-                    {"role": "user", "content": f"Table with dimensions and details in row order, with column names preceding the values {table}."},
-                    {"role": "user", "content": f"Product group hierarchy: {prod_group_desc}."},
-                    {"role": "user", "content": f"Product family hierarchy: {prod_family_desc}."},
-                    {"role": "user", "content": f"Category hierarchy: {category_desc}."},
-                    {"role": "user", "content": f"The summary:"}
-                ],
-            },
-        },
+#         {
+#             "custom_id": "hierarchy_summary",
+#             "method": "POST",
+#             "url": "/v1/responses",
+#             "body": {
+#                 "model": model_name,
+#                 "input": [
+#                     {"role": "developer", "content": """Your task is summarise a description of a building product made of pressed concrete.
+# The summary must capture the intended use (garden, home, public roads) and purpose, essential characteristics like  dimensions and colour.
+# If the description captures different flavours of the product, mention them all in the summary. The text will be later used to match
+# products to items enquired by a potential customer. Customer enquires are fuzzy and can be misaligned. So keep all relevant details
+# in the description. The product description is in czech and consists of four elements: product name, short description (marketing paragraph), longer
+# description (more technical description) and table with dimensions and details in row order. In addition you get also all the descriptions
+# from product hierarchy - from the top, category (most general set of products), product family and product group (lowest level).  Keep all replies in Czech language."""},
+#                     {"role": "user", "content": f"Product name: {product_name}"},
+#                     {"role": "user", "content": f"Short description marketing headline description: {short_desc}"},
+#                     {"role": "user", "content": f"Longer, more technical description: {long_desc}"},
+#                     {"role": "user", "content": f"Table with dimensions and details in row order, with column names preceding the values {table}."},
+#                     {"role": "user", "content": f"Product group hierarchy: {prod_group_desc}."},
+#                     {"role": "user", "content": f"Product family hierarchy: {prod_family_desc}."},
+#                     {"role": "user", "content": f"Category hierarchy: {category_desc}."},
+#                     {"role": "user", "content": f"The summary:"}
+#                 ],
+#             },
+#         },
         {
             "custom_id": "classifications",
             "method": "POST",
@@ -285,16 +286,14 @@ label = název; width = šířka, tloušťka or D; length = délka or L and heig
     return batch_input
 
 def get_product_summaries_and_tags(prod_name: str, short_desc: str, long_desc: str, table: str, prod_group_desc: str, prod_family_desc: str, category_desc: str) -> t.Optional[t.Dict[str, str]]:
-    model_name = "gpt-4.1-mini"
-    prod_desc_digest=hashlib.md5(";;;".join([model_name, prod_name, short_desc, long_desc, table, prod_group_desc, prod_family_desc, category_desc]).encode()).hexdigest()
-    fname=os.path.join("/home/cepekmir/Sources/wdf_best_catalog/tmp", f"summary-{prod_desc_digest}.json")
+    prod_desc_digest=hashlib.md5(";;;".join([cfg.get_settings().product_summary_extraction_model_name, prod_name, short_desc, long_desc, table, prod_group_desc, prod_family_desc, category_desc]).encode()).hexdigest()
+    fname=os.path.join(cfg.get_settings().product_summary_requests_cache_dir, f"summary-{prod_desc_digest}.json")
     if os.path.isfile(fname):
         with open(fname, mode="rt", encoding="utf-8") as f:
             return json.load(f)
 
-    client: oai.OpenAI = oai.OpenAI(api_key=os.environ.get("OPEN_AI_API_KEY"))
-    batch_data = summary_batch_requests(model_name=model_name,
-                                        product_name=prod_name,
+    client: oai.OpenAI = oai.OpenAI(api_key=cfg.get_settings().open_ai_api_key)
+    batch_data = summary_batch_requests(product_name=prod_name,
                                         short_desc=short_desc,
                                         long_desc=long_desc,
                                         table=table,
@@ -313,7 +312,7 @@ def get_product_summaries_and_tags(prod_name: str, short_desc: str, long_desc: s
     return batch_res
 
 def download_website(url: str) -> t.Optional[str]:
-    cache_path = os.path.join("/home/cepekmir/Sources/wdf_best_catalog/tmp/web/", hashlib.md5(url.encode()).hexdigest())
+    cache_path = os.path.join(cfg.get_settings().web_cache_dir, hashlib.md5(url.encode()).hexdigest())
     if os.path.exists(cache_path):
         with open(cache_path, "rt") as f:
             return f.read()
@@ -542,7 +541,7 @@ def process_one_product(prod: t.Dict[str, t.Any]) -> t.Tuple[t.List, t.List]:
                 category_desc=prod["category_description"]
             )
             prod["product_summary"] = summaries["product_summary"]
-            prod["product_summary_hierarchy"] = summaries["hierarchy_summary"]
+            # prod["product_summary_hierarchy"] = summaries["hierarchy_summary"]
             prod["product_classifications"] = summaries["classifications"]
             prod["product_param_colour"] = prod_details["product_parameters"]["BARVA"] if "BARVA" in prod_details["product_parameters"] else "NA"
             prod["product_param_exterior"] = prod_details["product_parameters"]["POVRCH"] if "POVRCH" in prod_details["product_parameters"] else "NA"
@@ -648,7 +647,7 @@ def main():
     # }]
 
     finished_products = []
-    executor: futures.Executor = futures.ThreadPoolExecutor(max_workers=1000)
+    executor: futures.Executor = futures.ThreadPoolExecutor(max_workers=10)
 
     while len(all_products) > 0:
         rexamine_products = []
@@ -670,7 +669,8 @@ def main():
         finished_products.extend(products_with_info)
         all_products = rexamine_products
 
-    json.dump(finished_products, open("all_products.json", "w", encoding="utf-8"), ensure_ascii=False, sort_keys=True, indent=4)
+    with open(os.path.join(cfg.get_settings().main_results_path_dir, "all_products.json"), "w", encoding="utf-8") as f:
+        json.dump(finished_products, f, ensure_ascii=False, sort_keys=True, indent=4)
 
 
 if __name__ == '__main__':

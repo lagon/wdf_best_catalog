@@ -2,8 +2,10 @@ from openai import OpenAI
 import os
 import tqdm
 
+import config.configuration as cfg
+
 def cancel_all_batches():
-    client = OpenAI(api_key=os.environ.get("OPEN_AI_API_KEY"))
+    client = OpenAI(api_key=cfg.get_settings().open_ai_api_key)
 
     cancelled = []
     # pagination loop

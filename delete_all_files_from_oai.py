@@ -3,12 +3,13 @@ import concurrent.futures as fut
 
 import openai as oai
 import tqdm
+import config.configuration as cfg
 
 def delete_oai_file(file_id: str) -> None:
     cli.files.delete(file_id)
 
 if __name__ == '__main__':
-    cli = oai.Client(api_key=os.environ.get("OPEN_AI_API_KEY"))
+    cli = oai.Client(api_key=cfg.get_settings().open_ai_api_key)
     all_files = cli.files.list()
 
     exec: fut.ThreadPoolExecutor = fut.ThreadPoolExecutor(10)
