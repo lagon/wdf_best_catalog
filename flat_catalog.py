@@ -89,5 +89,6 @@ class Collection:
         dists = self.embeddings.dot(query_embedding)
         indices = np.argsort(dists)[::-1]
         top_k_indices = indices[:top_k]
-        results = [(dists[i], self.items[i]) for i in top_k_indices]
-        return results
+        # result = [(dists[i], self.items[i]) for i in top_k_indices]
+        result = [self.items[i] for i in top_k_indices], dists[top_k_indices]
+        return result

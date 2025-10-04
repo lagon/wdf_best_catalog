@@ -26,3 +26,5 @@ with st.container(horizontal_alignment="center", vertical_alignment="center"):
         st.switch_page("pages/2_complete.py")
     if st.button("Batched hierarchical"):
         st.switch_page("pages/3_batched_hierarchy.py")
+    if st.button("Flat search __(new)__"):
+        st.switch_page("pages/4_flat_search.py")

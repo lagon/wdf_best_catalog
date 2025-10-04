@@ -91,8 +91,12 @@ def query_component() -> tuple[str, np.ndarray, bool] | None:
         placeholder="Enter query here...",
         height=INPUT_HEIGHT,
     )
-    to_preprocess_query = st.checkbox("LLM query preprocessing (todo)", disabled=True)
-    to_verify_results = st.checkbox("LLM result verification (todo)", disabled=True)
+    to_preprocess_query = st.checkbox(
+        "LLM query preprocessing (experimental)", disabled=True
+    )
+    to_verify_results = st.checkbox(
+        "LLM result verification (experimental)", disabled=True
+    )
     submitted = st.form_submit_button("Submit", type="primary")
     if not submitted or query_text == "":
         return None
