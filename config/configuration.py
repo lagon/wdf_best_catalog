@@ -15,10 +15,12 @@ class Settings(BaseSettings):
     product_summary_requests_cache_dir: str
     product_details_request_cache_dir: str
     product_grouping_request_cache_dir: str
+    product_resolution_cache_dir: str
 
     product_web_extraction_model_name: str #     model_name = "gpt-4.1-mini"
     product_summary_extraction_model_name: str #     model_name = "gpt-4.1-mini"
     hierarchy_inference_model_name: str
+    customer_description_expansion_model_name: str
 
     model_config = SettingsConfigDict(
         env_file=".env",
