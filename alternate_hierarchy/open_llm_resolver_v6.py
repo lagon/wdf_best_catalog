@@ -3,6 +3,7 @@ import collections
 import os
 import json
 import hashlib
+import re
 import typing as t
 
 import openai as oai
@@ -111,9 +112,11 @@ class SingleProductTypeQueryWorkItem(AbstractSelectionWorkItem):
         self._additional_data = additional_data.copy()
         os.makedirs(work_dir, exist_ok=True)
 
-        add_dta = "@@@".join([f"{k}={v}" for k, v in additional_data.items()])
+        ptd_json = json.dumps(product_types_description, ensure_ascii=False)
+        add_json = json.dumps(additional_data, ensure_ascii=False)
 
-        self._set_id(hashlib.md5(";;;".join([customer_request_description, "|||".join(product_types_description), add_dta, model_name]).encode()).hexdigest())
+
+        self._set_id(hashlib.md5(";;;".join([customer_request_description, ptd_json, add_json, model_name]).encode()).hexdigest())
 
     def _get_filename_prefix(self):
         return "product-type"
@@ -141,9 +144,10 @@ Product type fields:
 Respond with a single number indicating how well the customer requested product fit into the product type. The scale is 0 to 1. 
 0 means no fit, customer want something else, while 1 indicates strong fit."""
         batch_input = []
+        self._additional_data["PRODUCT TYPE INSTRUCTIONS"] = {}
         for prod_type, prod_type_desc in self._product_types_description.items():
             instructions = extend_description_prompt.format(CUSTOMER_REQUEST=self._customer_request_description, PRODUCT_TYPE=prod_type_desc)
-            self._additional_data["PRODUCT TYPE INSTRUCTIONS"] = instructions
+            self._additional_data["PRODUCT TYPE INSTRUCTIONS"][prod_type] = instructions
             batch_input.append(
                 self._get_request_body(request_id=prod_type, model_name=self._model_name, prompt=instructions, input="What is the fit between customer request and product type? Number only.")
             )
@@ -169,22 +173,22 @@ Respond with a single number indicating how well the customer requested product 
             )
 
 class SingleProductGroupQueryWorkItem(AbstractSelectionWorkItem):
-    def __init__(self, customer_request_description: str, product_group_data: t.Dict[str, str], additional_data: t.Dict[str, t.Union[str,float]], model_name: str, work_dir: str):
+    def __init__(self, customer_request_description: str, product_group_data: t.List[t.Dict[str, str]], additional_data: t.Dict[str, t.Union[str,float]], model_name: str, work_dir: str):
         super().__init__()
-        self._pg_description = product_group_data["AH PRODUCT GROUP DESCRIPTION"]
-        self._pg_prod_list = product_group_data["AH PRODUCT"]
-        self._pg_prod_colours = product_group_data["AH PRODUCT ALL COLOURS"]
-        self._pg_name = product_group_data["AH PRODUCT GROUP"]
+        self._prod_grp_dta = product_group_data
         self._customer_request_description = customer_request_description
         self._additional_data = additional_data.copy()
         self._model_name = model_name
         self._work_dir = work_dir
 
-        id_str = "|||".join([self._customer_request_description, self._pg_description, ";;;".join(self._pg_prod_list), ";;;".join(self._pg_prod_colours), self._model_name])
+        pgd_json = json.dumps(product_group_data, ensure_ascii=False)
+        add_json = json.dumps(additional_data, ensure_ascii=False)
+
+        id_str = "|||".join([self._customer_request_description, pgd_json, add_json, self._model_name])
         self._set_id(hashlib.md5(id_str.encode()).hexdigest())
 
     def _get_filename_prefix(self):
-        return "product-group"
+        return "product-group-v6"
 
     def get_jsonl_list(self) -> t.List[str]:
         extend_description_prompt: str = """You are selling products sold by manufacturer of prefabricated concrete slabs, tiles and other 
@@ -199,30 +203,32 @@ by an expanded version as guessed by LLM (in EXTENDED DESCRIPTION field). Custom
 
 The product group is described by it's name, in PRODUCT GROUP field, product group's description, in PRODUCT GROUP DESCRIPTION field.
 In addition there are two lists - list of all product names, in case they are fully or partially mentioned in request, in 
-ALL PRODUCT NAMES field. The second list contains colour variations of products within the product type, in AVAILABLE COLORS field.
+ALL PRODUCT NAMES field. The second list contains colour variations of products within the product group, in AVAILABLE COLORS field.
 If CUSTOMER DESCRIPTION contains full or partial name of any product mentioned in ALL PRODUCT NAMES field, it's a big boost for 
 the fit score, equals to 1, and indication that a customer needs exactly this product group. Also if the PRODUCT GROUP field contains
 full or part of CUSTOMER DESCRIPTION, it's also big boost to the fit that customer needs this product group. 
 
-Product type fields:
+Product group fields:
 {PRODUCT_GROUP}
 
-Respond with a single number indicating how well the customer requested product fit into the product type. The scale is 0 to 1. 
-0 means no fit, customer want something else, while 1 indicates strong fit."""
-
-        prod_grp_str = f"""
-PRODUCT GROUP: '{self._pg_name}'
-PRODUCT GROUP DESCRIPTION: '{self._pg_description}'
-ALL PRODUCT NAMES: '{"', '".join(self._pg_prod_list)}'
-AVAILABLE COLORS: '{"', '".join(self._pg_prod_colours)}')}}'
-"""
+Respond with a single number indicating how well the customer requested product fit into the product group. The scale is 0 to 1. 
+0 means no fit, customer want something else, while 1 indicates strong fit. Match in color or colormix only is much weaker signal
+unless the color match is supported by other indicators. Look for colors in AVAILABLE COLORS field."""
 
         batch_input = []
-        instructions = extend_description_prompt.format(CUSTOMER_REQUEST=self._customer_request_description, PRODUCT_GROUP=prod_grp_str)
-        self._additional_data["PRODUCT GROUP INSTRUCTIONS"] = instructions
-        batch_input.append(
-            self._get_request_body(request_id=self._pg_name, model_name=self._model_name, prompt=instructions, input="What is the fit between customer request and product type? Number only.")
-        )
+        self._additional_data["PRODUCT GROUP INSTRUCTIONS"] = {}
+        for grp_dta in self._prod_grp_dta:
+            prod_grp_str = f"""
+PRODUCT GROUP: '{grp_dta["AH PRODUCT GROUP"]}'
+PRODUCT GROUP DESCRIPTION: '{grp_dta["AH PRODUCT GROUP DESCRIPTION"]}'
+ALL PRODUCT NAMES: '{"', '".join(grp_dta["AH PRODUCT"])}'
+AVAILABLE COLORS: '{"', '".join(grp_dta["AH PRODUCT ALL COLOURS"])}')}}'
+"""
+            instructions = extend_description_prompt.format(CUSTOMER_REQUEST=self._customer_request_description, PRODUCT_GROUP=prod_grp_str)
+            self._additional_data["PRODUCT GROUP INSTRUCTIONS"][grp_dta["AH PRODUCT GROUP"]] = instructions
+            batch_input.append(
+                self._get_request_body(request_id=grp_dta["AH PRODUCT GROUP"], model_name=self._model_name, prompt=instructions, input="What is the fit between customer request and product type? Number only.")
+            )
         return batch_input
 
     def save_resposes(self, reponse_jsons: t.List[str]) -> None:
@@ -245,25 +251,27 @@ AVAILABLE COLORS: '{"', '".join(self._pg_prod_colours)}')}}'
             )
 
 class SingleProductQueryWorkItem(AbstractSelectionWorkItem):
-    def __init__(self, customer_request_description: str, product_data: t.Dict[str, str], additional_data: t.Dict[str, t.Union[str,float]], all_prod_colours: t.List[str], model_name: str, work_dir: str):
+    def __init__(self, customer_request_description: str, product_data: t.List[t.Dict[str, str]], additional_data: t.Dict[str, t.Union[str,float]], all_prod_colours: t.List[str], model_name: str, work_dir: str):
         super().__init__()
         self._customer_request_description = customer_request_description
-        self._prod_name = product_data["product_title"]
-        self._prod_summary = product_data["product_summary"]
-        self._prod_param_colour = product_data["product_param_colour"]
-        self._prod_dimension_table = product_data["product_table_details"]
-        self._prod_param_thickness = product_data["product_param_height"]
-        self._prod_parameters = product_data["product_parameters"]
         self._additional_data = additional_data.copy()
-        self._alt_colours = all_prod_colours.copy()
-        if self._prod_param_colour in self._alt_colours:
-            self._alt_colours.remove(self._prod_param_colour)
+        self._product_data = product_data
 
+        # self._prod_name = product_data["product_title"]
+        # self._prod_summary = product_data["product_summary"]
+        # self._prod_param_colour = product_data["product_param_colour"]
+        # self._prod_dimension_table = product_data["product_table_details"]
+        # self._prod_param_thickness = product_data["product_param_height"]
+        # self._prod_parameters = product_data["product_parameters"]
+
+        self._alt_colours = all_prod_colours.copy()
         self._model_name = model_name
         self._work_dir = work_dir
 
-        ppt = self._prod_param_thickness if type(self._prod_param_thickness) == str else ";".join(self._prod_param_thickness)
-        id_str = "|||".join([self._prod_name, self._prod_summary, self._prod_param_colour, ppt, customer_request_description, "/".join(self._alt_colours), self._model_name])
+        pdinfo = [json.dumps(pd, ensure_ascii=False) for pd in self._product_data]
+        adinfo = json.dumps(self._additional_data, ensure_ascii=False)
+
+        id_str = "|||".join([";".join(pdinfo), adinfo, model_name, customer_request_description])
         self._set_id(hashlib.md5(id_str.encode()).hexdigest())
 
     def _get_filename_prefix(self):
@@ -285,33 +293,43 @@ Colour is in PRODUCT COLOUR field. Dimensions are represented in two ways - by P
 and then width, length and height in millimeters. Second way is by PRODUCT THICKNESS indicating product thickness, if available, otherwise 'NA'. In 
 PRODUCT PARAMETERS are all optional parameters that were collected from the website. The format is json-like string with keys indicating meaning of the value.
 
-If customer request contains full or partial name of a colour, it's a strong signal, he wants exactly this product group. In terms of dimensions, they
+If customer request contains full or partial name of a colour, it's a strong signal, he wants exactly this product. In terms of dimensions, they
 can be much more fuzzy, but closer the better. If customer requested product colour matches colours of alternative products (listed 
-in ALTERNATIVE COLOURS field), the fit of this particulat product goes significantly down.
-    
+in ALTERNATIVE COLOURS field), the fit of this particular product goes significantly down.
+
 Product type fields:
 {PRODUCT_FIELD}
 
 ALTERNATIVE COLOURS: {ALTERNATIVE_COLOURS}
 
-Respond with a single number indicating how well the customer requested product fit into the product type. The scale is 0 to 1. 0 means no fit, customer
+Respond with a single number indicating how well the customer requested product fit into the product. The scale is 0 to 1. 0 means no fit, customer
 want something else, while 1 indicates strong fit."""
 
-        prod_str = f"""
-    PRODUCT: '{self._prod_name}'
-    PRODUCT SUMMARY: '{self._prod_summary}'
-    PRODUCT COLOUR: '{self._prod_param_colour}'
-    PRODUCT DIMENSIONS: '{self._prod_dimension_table}'
-    PRODUCT THICKNESS: '{self._prod_param_thickness}'
-    PRODUCT PARAMETERS: '{self._prod_parameters}'
-    """
-
         batch_input = []
-        instructions = extend_description_prompt.format(CUSTOMER_REQUEST=self._customer_request_description, PRODUCT_FIELD=prod_str, ALTERNATIVE_COLOURS=",".join(self._alt_colours))
-        self._additional_data["PRODUCT INSTRUCTIONS"] = instructions
-        batch_input.append(
-            self._get_request_body(request_id=self._prod_name, model_name=self._model_name, prompt=instructions, input="What is the fit between customer request and the product? Number only.")
-        )
+        for prodd in self._product_data:
+            prod_colour = prodd["product_param_colour"]
+            alt_colours = self._alt_colours.copy()
+            if prod_colour in alt_colours:
+                alt_colours.remove(prod_colour)
+
+            prod_param_thickness = prodd["product_param_height"]
+            ppt = prod_param_thickness if type(prod_param_thickness) == str else ";".join(prod_param_thickness)
+            prod_param = prodd["product_parameters"]
+
+            prod_str = f"""
+        PRODUCT: '{prodd["product_title"]}'
+        PRODUCT SUMMARY: '{prodd["product_summary"]}'
+        PRODUCT COLOUR: '{prod_colour}'
+        PRODUCT DIMENSIONS: '{prodd["product_table_details"]}'
+        PRODUCT THICKNESS: '{ppt}'
+        PRODUCT PARAMETERS: '{prod_param}'
+        """
+
+            instructions = extend_description_prompt.format(CUSTOMER_REQUEST=self._customer_request_description, PRODUCT_FIELD=prod_str, ALTERNATIVE_COLOURS=f"""'{"', '".join(alt_colours)}'""")
+            self._additional_data["PRODUCT INSTRUCTIONS"] = instructions
+            batch_input.append(
+                self._get_request_body(request_id=prodd["product_title"], model_name=self._model_name, prompt=instructions, input="What is the fit between customer request and the product? Number only.")
+            )
         return batch_input
 
     def save_resposes(self, reponse_jsons: t.List[str]) -> None:
@@ -333,9 +351,7 @@ want something else, while 1 indicates strong fit."""
                 ensure_ascii=False
             )
 
-
-
-def expand_customer_requested_product(request_offer_list: t.List[t.Dict], batch: oai_batch.OAI_Batch, desc_expansion_model_name: str, work_dir: str) -> t.List[t.Dict]:
+def expand_customer_requested_product(request_offer_list: t.List[t.Dict], batch: oai_batch.OAI_Worker, desc_expansion_model_name: str, work_dir: str) -> t.List[t.Dict]:
     desc_expansion_work_items: t.List[ExtendCustomerDescriptionSumWorkItem] = []
 
     for req_off in request_offer_list:
@@ -361,7 +377,7 @@ def expand_customer_requested_product(request_offer_list: t.List[t.Dict], batch:
         output.append(add_data)
     return output
 
-def find_product_type(desc_expansion: t.List[t.Dict[str, str]], alt_hierarchy_db: t.Dict[str, t.Dict[str, t.Any]], batch: oai_batch.OAI_Batch, desc_expansion_model_name: str, work_dir: str) -> t.Dict[str, t.List[t.Dict[str, str]]]:
+def find_product_type(desc_expansion: t.List[t.Dict[str, str]], alt_hierarchy_db: t.Dict[str, t.Dict[str, t.Any]], batch: oai_batch.OAI_Worker, desc_expansion_model_name: str, work_dir: str) -> t.Dict[str, t.List[t.Dict[str, str]]]:
 
     all_product_types: t.Dict[str, str] = {}
     for prod_types in alt_hierarchy_db["product_types_db"].values():
@@ -389,41 +405,70 @@ EXTENDED DESCRIPTION: '{desc["EXTENDED DESCRIPTION"]}'
     for wi in all_work_items:
         resp = wi.get_responses()
         add_data = resp["additional_data"]
-        for prod_type, prot_type_val in resp.items():
+        prod_type_fits = []
+
+        for prod_type, prod_type_val in resp.items():
             if prod_type == "additional_data":
                 continue
-            if prod_type not in set(all_product_types.keys()):
+            if prod_type not in all_product_types.keys():
                 print(f"UNKNOWN PRODUCT TYPE: {prod_type}")
             else:
-                prot_type_prob = float(prot_type_val)
-                if prot_type_prob <= 0.4:
-                    no_match.append(resp)
-                else:
-                    output.append({
-                        "FINAL OUTPUT": add_data["FINAL OUTPUT"],
-                        "CUSTOMER DESC": add_data["CUSTOMER DESC"],
-                        "EXTENDED DESCRIPTION": add_data["EXTENDED DESCRIPTION"],
-                        "PRODUCT TYPE": prod_type,
-                        "PRODUCT TYPE PCT": prot_type_prob,
-                        "PRODUCT TYPE INSTRUCTIONS": add_data["PRODUCT TYPE INSTRUCTIONS"],
-                    })
+                prod_group_prob = float(prod_type_val)
+                prod_type_fits.append((prod_type, prod_group_prob))
+
+        prod_type_fits = sorted(prod_type_fits, key=lambda x: x[1], reverse=True)
+
+        no_fit_prod_types = list(filter(lambda x: x[1] <= 0.1, prod_type_fits))
+        prod_type_fits = list(filter(lambda x: x[1] > 0.1, prod_type_fits))
+
+        if len(prod_type_fits) > 0:
+            if prod_type_fits[0][1] > 0.4:
+                no_fit_prod_types.extend(list(filter(lambda x: x[1] <= 0.4, prod_type_fits)))
+                prod_type_fits = list(filter(lambda x: x[1] > 0.4, prod_type_fits))
+            else:
+                num_tried = min(len(prod_type_fits), 2)
+                last_same_fit = 0
+                for idx, x in enumerate(prod_type_fits):
+                    if x[1] == prod_type_fits[0][1]:
+                        last_same_fit = idx
+                num_tried = max(last_same_fit, num_tried)
+
+                no_fit_prod_types.extend(prod_type_fits[num_tried:])
+                prod_type_fits = prod_type_fits[:num_tried]
+
+        for nofit in no_fit_prod_types:
+            nf = add_data.copy()
+            nf[nofit[0]] = nofit[1]
+            no_match.append(nf)
+        for prod_type in prod_type_fits:
+            output.append({
+                "FINAL OUTPUT": add_data["FINAL OUTPUT"],
+                "CUSTOMER DESC": add_data["CUSTOMER DESC"],
+                "EXTENDED DESCRIPTION": add_data["EXTENDED DESCRIPTION"],
+                "PRODUCT TYPE": prod_type[0],
+                "PRODUCT TYPE PCT": prod_type[1],
+                "PRODUCT TYPE INSTRUCTIONS": add_data["PRODUCT TYPE INSTRUCTIONS"],
+            })
 
     return {
         "match": output,
         "no_match": no_match
     }
 
-def find_product_group(selected_product_type: t.List[t.Dict[str, str]], alt_hierarchy_db: t.Dict[str, t.Dict[str, t.Any]], batch: oai_batch.OAI_Batch, desc_expansion_model_name: str, work_dir: str) -> t.Dict[str, t.List[t.Dict[str, str]]]:
+def find_product_group(selected_product_type: t.List[t.Dict[str, str]], alt_hierarchy_db: t.Dict[str, t.Dict[str, t.Any]], batch: oai_batch.OAI_Worker, desc_expansion_model_name: str, work_dir: str) -> t.Dict[str, t.List[t.Dict[str, str]]]:
     all_work_items: t.List[SingleProductGroupQueryWorkItem] = []
     for spt in selected_product_type:
         all_prod_groups = alt_hierarchy_db["product_types_db"][spt["PRODUCT TYPE"]]["AH PRODUCT GROUPS"]
-        for pg in all_prod_groups:
-            req_prod = f"""
+        req_prod = f"""
 CUSTOMER DESCRIPTION: '{spt["CUSTOMER DESC"]}'
 EXTENDED DESCRIPTION: '{spt["EXTENDED DESCRIPTION"]}' 
-        """
-            prod_group_details = alt_hierarchy_db["product_group_db"][pg]
-            all_work_items.append(SingleProductGroupQueryWorkItem(customer_request_description=req_prod, product_group_data=prod_group_details, additional_data=spt.copy(), model_name=desc_expansion_model_name, work_dir=work_dir))
+"""
+
+        prod_grp_details = []
+        for pg in all_prod_groups:
+            prod_grp_details.append(alt_hierarchy_db["product_group_db"][pg])
+
+        all_work_items.append(SingleProductGroupQueryWorkItem(customer_request_description=req_prod, product_group_data=prod_grp_details, additional_data=spt.copy(), model_name=desc_expansion_model_name, work_dir=work_dir))
 
     batch.add_work_items(all_work_items)
     batch.run_loop()
@@ -434,6 +479,8 @@ EXTENDED DESCRIPTION: '{spt["EXTENDED DESCRIPTION"]}'
     for wi in all_work_items:
         resp = wi.get_responses()
         add_data = resp["additional_data"]
+        prod_grp_fits = []
+
         for prod_group, prod_group_val in resp.items():
             if prod_group == "additional_data":
                 continue
@@ -441,26 +488,49 @@ EXTENDED DESCRIPTION: '{spt["EXTENDED DESCRIPTION"]}'
                 print(f"UNKNOWN PRODUCT TYPE: {prod_group}")
             else:
                 prod_group_prob = float(prod_group_val)
-                if prod_group_prob <= 0.5:
-                    no_match.append(resp)
-                else:
-                    output.append({
-                        "FINAL OUTPUT": add_data["FINAL OUTPUT"],
-                        "CUSTOMER DESC": add_data["CUSTOMER DESC"],
-                        "EXTENDED DESCRIPTION": add_data["EXTENDED DESCRIPTION"],
-                        "PRODUCT TYPE": add_data["PRODUCT TYPE"],
-                        "PRODUCT TYPE PCT": add_data["PRODUCT TYPE PCT"],
-                        "PRODUCT TYPE INSTRUCTIONS": add_data["PRODUCT TYPE INSTRUCTIONS"],
-                        "PRODUCT GROUP": prod_group,
-                        "PRODUCT GROUP PCT": prod_group_prob,
-                        "PRODUCT GROUP INSTRUCTIONS": add_data["PRODUCT GROUP INSTRUCTIONS"],
-                    })
+                prod_grp_fits.append((prod_group, prod_group_prob))
+
+        prod_grp_fits = sorted(prod_grp_fits, key=lambda x: x[1], reverse=True)
+
+        no_fit_prod_grp = list(filter(lambda x: x[1] <= 0.1, prod_grp_fits))
+        prod_grp_fits = list(filter(lambda x: x[1] > 0.1, prod_grp_fits))
+
+        if len(prod_grp_fits) > 0:
+            if prod_grp_fits[0][1] > 0.5:
+                no_fit_prod_grp.extend(list(filter(lambda x: x[1] <= 0.5, prod_grp_fits)))
+                prod_grp_fits = list(filter(lambda x: x[1] > 0.5, prod_grp_fits))
+            else:
+                num_tried = min(len(prod_grp_fits), 2)
+                last_same_fit = 0
+                for idx, x in enumerate(prod_grp_fits):
+                    if x[1] == prod_grp_fits[0][1]:
+                        last_same_fit = idx
+                num_tried = max(last_same_fit, num_tried)
+                no_fit_prod_grp.extend(prod_grp_fits[num_tried:])
+                prod_grp_fits = prod_grp_fits[:num_tried]
+
+        for nofit in no_fit_prod_grp:
+            nf = add_data.copy()
+            nf[nofit[0]] = nofit[1]
+            no_match.append(nf)
+        for prod_group in prod_grp_fits:
+            output.append({
+                "FINAL OUTPUT": add_data["FINAL OUTPUT"],
+                "CUSTOMER DESC": add_data["CUSTOMER DESC"],
+                "EXTENDED DESCRIPTION": add_data["EXTENDED DESCRIPTION"],
+                "PRODUCT TYPE": add_data["PRODUCT TYPE"],
+                "PRODUCT TYPE PCT": add_data["PRODUCT TYPE PCT"],
+                "PRODUCT TYPE INSTRUCTIONS": add_data["PRODUCT TYPE INSTRUCTIONS"],
+                "PRODUCT GROUP": prod_group[0],
+                "PRODUCT GROUP PCT": prod_group[1],
+                "PRODUCT GROUP INSTRUCTIONS": add_data["PRODUCT GROUP INSTRUCTIONS"],
+            })
     return {
         "match": output,
         "no_match": no_match
     }
 
-def find_products(selected_product_groups: t.List[t.Dict[str, t.Union[str, float]]], alt_hierarchy_db: t.Dict[str, t.Any], batch: oai_batch.OAI_Batch, desc_expansion_model_name: str, work_dir: str) -> t.Dict[str, t.List[t.Dict[str, t.Union[str, float]]]]:
+def find_products(selected_product_groups: t.List[t.Dict[str, t.Union[str, float]]], alt_hierarchy_db: t.Dict[str, t.Any], batch: oai_batch.OAI_Worker, desc_expansion_model_name: str, work_dir: str) -> t.Dict[str, t.List[t.Dict[str, t.Union[str, float]]]]:
     all_work_items: t.List[SingleProductQueryWorkItem] = []
     for spt in selected_product_groups:
         products = alt_hierarchy_db["product_group_db"][spt["PRODUCT GROUP"]]["AH PRODUCT"]
@@ -469,17 +539,20 @@ CUSTOMER DESCRIPTION: '{spt["CUSTOMER DESC"]}'
 EXTENDED DESCRIPTION: '{spt["EXTENDED DESCRIPTION"]}' 
         """
 
+        prod_data = []
         for prod in products:
-            all_work_items.append(
-                SingleProductQueryWorkItem(
-                    customer_request_description=req_prod,
-                    product_data=alt_hierarchy_db["product_db"][prod],
-                    all_prod_colours=alt_hierarchy_db["product_group_db"][spt["PRODUCT GROUP"]]["AH PRODUCT ALL COLOURS"],
-                    additional_data=spt.copy(),
-                    model_name=desc_expansion_model_name,
-                    work_dir=work_dir
-                )
+            prod_data.append(alt_hierarchy_db["product_db"][prod])
+
+        all_work_items.append(
+            SingleProductQueryWorkItem(
+                customer_request_description=req_prod,
+                product_data=prod_data,
+                all_prod_colours=alt_hierarchy_db["product_group_db"][spt["PRODUCT GROUP"]]["AH PRODUCT ALL COLOURS"],
+                additional_data=spt.copy(),
+                model_name=desc_expansion_model_name,
+                work_dir=work_dir
             )
+        )
     batch.add_work_items(all_work_items)
     batch.run_loop()
 
@@ -488,32 +561,56 @@ EXTENDED DESCRIPTION: '{spt["EXTENDED DESCRIPTION"]}'
     for wi in all_work_items:
         resp = wi.get_responses()
         add_data = resp["additional_data"]
+        prod_fits = []
+
+
         for prod, prod_val in resp.items():
-            if prod == 'BEST - BEATON DRENO PŘÍRODNÍ':
-                print("XXXX")
             if prod == "additional_data":
                 continue
             if prod not in alt_hierarchy_db["product_db"]:
                 print(f"UNKNOWN PRODUCT TYPE: {prod}")
             else:
                 prod_prob = float(prod_val)
-                if prod_prob <= 0.6:
-                    no_match.append(resp)
-                else:
-                    output.append({
-                        "FINAL OUTPUT": add_data["FINAL OUTPUT"],
-                        "CUSTOMER DESC": add_data["CUSTOMER DESC"],
-                        "EXTENDED DESCRIPTION": add_data["EXTENDED DESCRIPTION"],
-                        "PRODUCT TYPE": add_data["PRODUCT TYPE"],
-                        "PRODUCT TYPE PCT": add_data["PRODUCT TYPE PCT"],
-                        "PRODUCT TYPE INSTRUCTIONS": add_data["PRODUCT TYPE INSTRUCTIONS"],
-                        "PRODUCT GROUP": add_data["PRODUCT GROUP"],
-                        "PRODUCT GROUP PCT": add_data["PRODUCT GROUP PCT"],
-                        "PRODUCT GROUP INSTRUCTIONS": add_data["PRODUCT GROUP INSTRUCTIONS"],
-                        "PRODUCT": prod,
-                        "PRODUCT PCT": prod_prob,
-                        "PRODUCT INSTRUCTIONS": add_data["PRODUCT INSTRUCTIONS"],
-                    })
+                prod_fits.append((prod, prod_prob))
+
+        prod_fits = sorted(prod_fits, key=lambda x: x[1], reverse=True)
+
+        no_fit_prod = list(filter(lambda x: x[1] <= 0.1, prod_fits))
+        prod_fits = list(filter(lambda x: x[1] > 0.1, prod_fits))
+
+        if len(prod_fits) > 0:
+            if prod_fits[0][1] > 0.5:
+                no_fit_prod.extend(list(filter(lambda x: x[1] <= 0.5, prod_fits)))
+                prod_fits = list(filter(lambda x: x[1] > 0.5, prod_fits))
+            else:
+                num_tried = min(len(prod_fits), 2)
+                last_same_fit = 0
+                for idx, x in enumerate(prod_fits):
+                    if x[1] == prod_fits[0][1]:
+                        last_same_fit = idx
+                num_tried = max(last_same_fit, num_tried)
+                no_fit_prod.extend(prod_fits[num_tried:])
+                prod_fits = prod_fits[:num_tried]
+
+        for nofit in no_fit_prod:
+            nf = add_data.copy()
+            nf[nofit[0]] = nofit[1]
+            no_match.append(nf)
+        for prod in prod_fits:
+            output.append({
+                "FINAL OUTPUT": add_data["FINAL OUTPUT"],
+                "CUSTOMER DESC": add_data["CUSTOMER DESC"],
+                "EXTENDED DESCRIPTION": add_data["EXTENDED DESCRIPTION"],
+                "PRODUCT TYPE": add_data["PRODUCT TYPE"],
+                "PRODUCT TYPE PCT": add_data["PRODUCT TYPE PCT"],
+                "PRODUCT TYPE INSTRUCTIONS": add_data["PRODUCT TYPE INSTRUCTIONS"],
+                "PRODUCT GROUP": add_data["PRODUCT GROUP"],
+                "PRODUCT GROUP PCT": add_data["PRODUCT GROUP PCT"],
+                "PRODUCT GROUP INSTRUCTIONS": add_data["PRODUCT GROUP INSTRUCTIONS"],
+                "PRODUCT": prod[0],
+                "PRODUCT PCT": prod[1],
+                "PRODUCT INSTRUCTIONS": add_data["PRODUCT INSTRUCTIONS"],
+            })
     return {
         "match": output,
         "no_match": no_match
@@ -524,14 +621,14 @@ def main():
         alt_hierarchy_db = json.load(f)
 
     request_offer_list = [
-        # {
-        #     "CUSTOMER DESCRIPTION": "DLAŽBY VEGETAČNÍ Z TVÁRNIC Z PLASTICKÝCH HMOT -  dlaždice tl. 60mm",
-        #     "OFFERED PRODUCT NAME": ""
-        # },
-        # {
-        #     "CUSTOMER DESCRIPTION": "Beleza, 100m2, Moka",
-        #     "OFFERED PRODUCT NAME": ""
-        # },
+        {
+            "CUSTOMER DESCRIPTION": "DLAŽBY VEGETAČNÍ Z TVÁRNIC Z PLASTICKÝCH HMOT -  dlaždice tl. 60mm",
+            "OFFERED PRODUCT NAME": ""
+        },
+        {
+            "CUSTOMER DESCRIPTION": "Beleza, 100m2, Moka",
+            "OFFERED PRODUCT NAME": ""
+        },
         {
             "CUSTOMER DESCRIPTION": "DRENÁŽNÍ VÝUSŤ Z BETON DÍLCŮ - pro drenáž DN 150mm",
             "OFFERED PRODUCT NAME": ""
@@ -540,20 +637,20 @@ def main():
             "CUSTOMER DESCRIPTION": "DRENÁŽNÍ VÝUSŤ Z BETON DÍLCŮ - pro drenáž DN 200mm",
             "OFFERED PRODUCT NAME": ""
         },
-        # {
-        #     "CUSTOMER DESCRIPTION": "KRYTY Z BETON DLAŽDIC SE ZÁMKEM BAREV RELIÉF TL 60MM",
-        #     "OFFERED PRODUCT NAME": "BEST - BEATON PRO NEVIDOMÉ ČERVENÁ"
-        # },
-        # {
-        #     "CUSTOMER DESCRIPTION": "KRYTY Z BETON DLAŽDIC SE ZÁMKEM BAREV TL 60MM",
-        #     "OFFERED PRODUCT NAME": "BEST - BEATON ČERVENÁ"
-        # },
-        # {
-        #     "CUSTOMER DESCRIPTION": "KRYTY Z BETON DLAŽDIC SE ZÁMKEM ŠEDÝCH TL 60MM",
-        #     "OFFERED PRODUCT NAME": "BEST - BEATON PŘÍRODNÍ"
-        # },
         {
-            "CUSTOMER DESCRIPTION": "NÁSTUPIŠTNÍ OBRUBNÍKY BETONOVÉ - bezbariérový obrubník HK 400/290/1000-P",
+            "CUSTOMER DESCRIPTION": "KRYTY Z BETON DLAŽDIC SE ZÁMKEM BAREV RELIÉF TL 60MM",
+            "OFFERED PRODUCT NAME": "BEST - BEATON PRO NEVIDOMÉ ČERVENÁ"
+        },
+        {
+            "CUSTOMER DESCRIPTION": "KRYTY Z BETON DLAŽDIC SE ZÁMKEM BAREV TL 60MM",
+            "OFFERED PRODUCT NAME": "BEST - BEATON ČERVENÁ"
+        },
+        {
+            "CUSTOMER DESCRIPTION": "KRYTY Z BETON DLAŽDIC SE ZÁMKEM ŠEDÝCH TL 60MM",
+            "OFFERED PRODUCT NAME": "BEST - BEATON PŘÍRODNÍ"
+        },
+        {
+                "CUSTOMER DESCRIPTION": "NÁSTUPIŠTNÍ OBRUBNÍKY BETONOVÉ - bezbariérový obrubník HK 400/290/1000-P",
             "OFFERED PRODUCT NAME": "BEST - ZASTÁVKOVÝ OBRUBNÍK PŘÍMÝ PŘÍRODNÍ"
         },
         {
@@ -564,41 +661,43 @@ def main():
             "CUSTOMER DESCRIPTION": "PŘÍKOPOVÉ ŽLABY Z BETON TVÁRNIC ŠÍŘ 600MM",
             "OFFERED PRODUCT NAME": "BEST - ŽLAB I PŘÍRODNÍ"
         },
-        # {
-        #     "CUSTOMER DESCRIPTION": "SILNIČNÍ A CHODNÍKOVÉ OBRUBY Z BETONOVÝCH OBRUBNÍKŮ ŠÍŘ 100MM - výška 250mm",
-        #     "OFFERED PRODUCT NAME": "BEST - SINIA I PŘÍRODNÍ"
-        # },
-        # {
-        #     "CUSTOMER DESCRIPTION": "SILNIČNÍ A CHODNÍKOVÉ OBRUBY Z BETONOVÝCH OBRUBNÍKŮ ŠÍŘ 150MM - výška 150mm (nájezdový)",
-        #     "OFFERED PRODUCT NAME": "BEST - MONO NÁJEZDOVÝ ROVNÝ PŘÍRODNÍ"
-        # },
-        # {
-        #     "CUSTOMER DESCRIPTION": "SILNIČNÍ A CHODNÍKOVÉ OBRUBY Z BETONOVÝCH OBRUBNÍKŮ ŠÍŘ 150MM - výška 250mm",
-        #     "OFFERED PRODUCT NAME": "BEST - MONO II PŘÍRODNÍ"
-        # },
-        # {
-        #     "CUSTOMER DESCRIPTION": "SILNIČNÍ A CHODNÍKOVÉ OBRUBY Z BETONOVÝCH OBRUBNÍKŮ ŠÍŘ 150MM - výška 300mm",
-        #     "OFFERED PRODUCT NAME": "BEST - MONO I PŘÍRODNÍ"
-        # },
-        # {
-        #     "CUSTOMER DESCRIPTION": "ZÁHONOVÉ OBRUBY Z BETONOVÝCH OBRUBNÍKŮ ŠÍŘ 50MM - výška 200mm",
-        #     "OFFERED PRODUCT NAME": "BEST - PARKAN II PŘÍRODNÍ"
-        # },
+        {
+            "CUSTOMER DESCRIPTION": "SILNIČNÍ A CHODNÍKOVÉ OBRUBY Z BETONOVÝCH OBRUBNÍKŮ ŠÍŘ 100MM - výška 250mm",
+            "OFFERED PRODUCT NAME": "BEST - SINIA I PŘÍRODNÍ"
+        },
+        {
+            "CUSTOMER DESCRIPTION": "SILNIČNÍ A CHODNÍKOVÉ OBRUBY Z BETONOVÝCH OBRUBNÍKŮ ŠÍŘ 150MM - výška 150mm (nájezdový)",
+            "OFFERED PRODUCT NAME": "BEST - MONO NÁJEZDOVÝ ROVNÝ PŘÍRODNÍ"
+        },
+        {
+            "CUSTOMER DESCRIPTION": "SILNIČNÍ A CHODNÍKOVÉ OBRUBY Z BETONOVÝCH OBRUBNÍKŮ ŠÍŘ 150MM - výška 250mm",
+            "OFFERED PRODUCT NAME": "BEST - MONO II PŘÍRODNÍ"
+        },
+        {
+            "CUSTOMER DESCRIPTION": "SILNIČNÍ A CHODNÍKOVÉ OBRUBY Z BETONOVÝCH OBRUBNÍKŮ ŠÍŘ 150MM - výška 300mm",
+            "OFFERED PRODUCT NAME": "BEST - MONO I PŘÍRODNÍ"
+        },
+        {
+            "CUSTOMER DESCRIPTION": "ZÁHONOVÉ OBRUBY Z BETONOVÝCH OBRUBNÍKŮ ŠÍŘ 50MM - výška 200mm",
+            "OFFERED PRODUCT NAME": "BEST - PARKAN II PŘÍRODNÍ"
+        },
         {
             "CUSTOMER DESCRIPTION": "ŽLABY A RIGOLY DLÁŽDĚNÉ Z BETONOVÝCH DLAŽDIC - 500x250x80mm",
             "OFFERED PRODUCT NAME": "BEST - NAVIGA PŘÍRODNÍ"
-        # }, {
-        #     "CUSTOMER DESCRIPTION": "64,8 m2 - BELEZA 6 CM, COLORMIX ARABICA",
-        #     "OFFERED PRODUCT NAME": ""
-        # }, {
-        #     "CUSTOMER DESCRIPTION": "120,96 m2 - BELEZA 8 CM, COLORMIX ARABICA",
-        #     "OFFERED PRODUCT NAME": ""
-        # }, {
-        #     "CUSTOMER DESCRIPTION": "INBELEZA8M11 4440010002 BEST BELEZA 80 arabica 61,56 m2 26098",
-        #     "OFFERED PRODUCT NAME": ""
-        # }, {
-        #     "CUSTOMER DESCRIPTION": "INBELEZA6M11 4440010003 BEST BELEZA 60 arabica 45,36 m2 26098",
-        #     "OFFERED PRODUCT NAME": ""
+        },
+        {
+            "CUSTOMER DESCRIPTION": "64,8 m2 - BELEZA 6 CM, COLORMIX ARABICA",
+            "OFFERED PRODUCT NAME": ""
+        },
+        {
+            "CUSTOMER DESCRIPTION": "120,96 m2 - BELEZA 8 CM, COLORMIX ARABICA",
+            "OFFERED PRODUCT NAME": ""
+        }, {
+            "CUSTOMER DESCRIPTION": "INBELEZA8M11 4440010002 BEST BELEZA 80 arabica 61,56 m2 26098",
+            "OFFERED PRODUCT NAME": ""
+        }, {
+            "CUSTOMER DESCRIPTION": "INBELEZA6M11 4440010003 BEST BELEZA 60 arabica 45,36 m2 26098",
+            "OFFERED PRODUCT NAME": ""
         },
     ]
 
@@ -606,17 +705,25 @@ def main():
     all_no_match_list = []
 
     client: oai.OpenAI = oai.OpenAI(api_key=cfg.get_settings().open_ai_api_key)
-    batch: oai_batch.OAI_Batch = oai_batch.OAI_Batch(client=client, number_active_batches=100, max_work_items_to_add=100, return_work_items=False, working_dir=cfg.get_settings().product_resolution_cache_dir)
 
+    # batch: oai_batch.OAI_Worker = oai_batch.OAI_Batch(client=client, number_active_batches=100, max_work_items_to_add=100, tag="extend_desc", working_dir=cfg.get_settings().product_resolution_cache_dir)
+    batch: oai_batch.OAI_Worker = oai_batch.OAI_Direct(client=client, number_active_batches=100, max_work_items_to_add=100, tag="extend_desc", working_dir=cfg.get_settings().product_resolution_cache_dir)
     desc_expansion: t.List[t.Dict] = expand_customer_requested_product(request_offer_list=request_offer_list, batch=batch, desc_expansion_model_name=cfg.get_settings().customer_description_expansion_model_name, work_dir=cfg.get_settings().product_resolution_cache_dir)
+
+    # batch: oai_batch.OAI_Worker = oai_batch.OAI_Batch(client=client, number_active_batches=100, max_work_items_to_add=100, tag="find_prod_type", working_dir=cfg.get_settings().product_resolution_cache_dir)
+    batch: oai_batch.OAI_Worker = oai_batch.OAI_Direct(client=client, number_active_batches=100, max_work_items_to_add=100, tag="find_prod_type", working_dir=cfg.get_settings().product_resolution_cache_dir)
     output = find_product_type(desc_expansion=desc_expansion, alt_hierarchy_db=alt_hierarchy_db, batch=batch, desc_expansion_model_name=cfg.get_settings().hierarchy_inference_model_name, work_dir=cfg.get_settings().product_resolution_cache_dir)
     selected_product_types = output["match"]
     all_no_match_list.extend(output["no_match"])
 
+    # batch: oai_batch.OAI_Worker = oai_batch.OAI_Batch(client=client, number_active_batches=100, max_work_items_to_add=100, tag="find_prod_group", working_dir=cfg.get_settings().product_resolution_cache_dir)
+    batch: oai_batch.OAI_Worker = oai_batch.OAI_Direct(client=client, number_active_batches=100, max_work_items_to_add=100, tag="find_prod_group", working_dir=cfg.get_settings().product_resolution_cache_dir)
     output = find_product_group(selected_product_type=selected_product_types, alt_hierarchy_db=alt_hierarchy_db, batch=batch, desc_expansion_model_name=cfg.get_settings().hierarchy_inference_model_name, work_dir=cfg.get_settings().product_resolution_cache_dir)
     selected_product_groups = output["match"]
     all_no_match_list.extend(output["no_match"])
 
+    # batch: oai_batch.OAI_Worker = oai_batch.OAI_Batch(client=client, number_active_batches=100, max_work_items_to_add=100, tag="find_prod", working_dir=cfg.get_settings().product_resolution_cache_dir)
+    batch: oai_batch.OAI_Worker = oai_batch.OAI_Direct(client=client, number_active_batches=100, max_work_items_to_add=100, tag="find_prod", working_dir=cfg.get_settings().product_resolution_cache_dir)
     output = find_products(selected_product_groups=selected_product_groups, alt_hierarchy_db=alt_hierarchy_db, batch=batch, desc_expansion_model_name=cfg.get_settings().hierarchy_inference_model_name, work_dir=cfg.get_settings().product_resolution_cache_dir)
     selected_products = output["match"]
     all_no_match_list.extend(output["no_match"])

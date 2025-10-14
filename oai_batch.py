@@ -9,6 +9,8 @@ import time
 import typing as t
 
 import openai as oai
+from openai.types.chat import ChatCompletionSystemMessageParam, ChatCompletionUserMessageParam
+import tqdm
 
 import bucketize as buck
 
@@ -33,16 +35,68 @@ class WorkItem(abc.ABC):
     def save_error_message(self, reponse_jsons: t.List[str]) -> None:
         raise NotImplementedError
 
+class OAI_Worker(metaclass=abc.ABCMeta):
+    @abc.abstractmethod
+    def add_work_items(self, work_items: t.List[WorkItem]) -> None:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def run_loop(self) -> None:
+        raise NotImplementedError
 
 
-class OAI_Batch():
-    def __init__(self, client: oai.Client, working_dir: str, number_active_batches: int, max_work_items_to_add: int, return_work_items: bool):
+class OAI_Direct(OAI_Worker):
+    def __init__(self, client: oai.Client, working_dir: str, number_active_batches: int, max_work_items_to_add: int, tag: str):
         self.client = client
         self.working_dir = working_dir
         self.work_items: t.List = []
         self.number_active_batches = number_active_batches
         self._max_work_items_to_add = max_work_items_to_add
-        self._return_work_items = return_work_items
+        self._tag = tag
+
+    def add_work_items(self, work_items: t.List[WorkItem]) -> None:
+        self.work_items.extend(work_items)
+
+    def run_loop(self) -> None:
+        for wi_num, work_item in enumerate(self.work_items):
+            if work_item.is_new():
+                lines = work_item.get_jsonl_list()
+                all_responses = []
+                for l in tqdm.tqdm(lines, desc=f"Working on WORK ITEM {wi_num+1}/{len(self.work_items)}", ncols=150):
+                    wi_data = json.loads(l)
+                    prompt = [
+                        ChatCompletionSystemMessageParam(role="system", content=wi_data["body"]["messages"][0]["content"]),
+                        ChatCompletionUserMessageParam(role="user", content=wi_data["body"]["messages"][1]["content"])
+                    ]
+
+                    response = self.client.chat.completions.create(model=wi_data["body"]["model"], messages=prompt, max_tokens=300)
+                    resp_parsed = json.loads(response.to_json())
+                    resp = {
+                        "custom_id": wi_data["custom_id"],
+                        "response": {
+                            "body": {
+                                "choices":[
+                                    {"message": {"content": resp_parsed["choices"][0]["message"]["content"]}},
+                                ]
+                            }
+                        }
+                    }
+
+                    all_responses.append(resp)
+
+                work_item.save_resposes(all_responses)
+        return
+
+
+
+class OAI_Batch(OAI_Worker):
+    def __init__(self, client: oai.Client, working_dir: str, number_active_batches: int, max_work_items_to_add: int, tag: str):
+        self.client = client
+        self.working_dir = working_dir
+        self.work_items: t.List = []
+        self.number_active_batches = number_active_batches
+        self._max_work_items_to_add = max_work_items_to_add
+        self._tag = tag
 
     def add_work_items(self, work_items: t.List[WorkItem]) -> None:
         self.work_items.extend(work_items)
@@ -59,7 +113,7 @@ class OAI_Batch():
         # return len(all_recorded_batches) <= self.number_active_batches
 
 
-    def _get_llm_batch_running_filename(self, batch_id, working_dir) -> str:
+    def _get_llm_batch_running_filename(self, batch_id: str, working_dir: str) -> str:
         buck.ensure_bucket_directory_exists(filename=f"llm_batch_info_{batch_id}.running_batch.pickle", buckets_root=working_dir)
         return buck.bucketized_filename(filename=f"llm_batch_info_{batch_id}.running_batch.pickle", buckets_root=working_dir)
 
@@ -82,6 +136,7 @@ class OAI_Batch():
         with open(self._get_llm_batch_running_filename(batch_id=work_item.get_id(), working_dir=self.working_dir), "wb") as f:
             pickle.dump({
                 "batch_id": batch_data.id,
+                "batch_tag": self._tag,
                 "work_item": work_item
             }, f)
         return work_item
@@ -113,6 +168,9 @@ class OAI_Batch():
             with open(os.path.join(self.working_dir, fn), "rb") as f:
                 batch = pickle.load(f)
 
+            if batch["batch_tag"] != self._tag:
+                continue
+
             try:
                 batch_info = self.client.batches.retrieve(batch_id=batch["batch_id"])
                 batch_status.update([batch_info.status])
@@ -141,8 +199,7 @@ class OAI_Batch():
         print(batch_status)
         return finished_out_files, (batch_status.total() - len(finished_out_files))
 
-    def _download_and_save_finished_batches(self, finished_file_ids: t.List[t.Dict[str, t.Any]]) -> t.List[WorkItem]:
-        out_workitems: t.List[WorkItem] = []
+    def _download_and_save_finished_batches(self, finished_file_ids: t.List[t.Dict[str, t.Any]]) -> None:
         for ffid in finished_file_ids:
             wi: WorkItem = ffid["work_item"]
             if ffid["output_file_id"] is not None:
@@ -154,17 +211,14 @@ class OAI_Batch():
                         reponse_jsons.append(json.loads(line))
 
                 wi.save_resposes(reponse_jsons)
-                if self._return_work_items:
-                    out_workitems.append(wi)
+
             else:
                 file_content = self.client.files.content(file_id=ffid["error_file_id"])
                 response_lines = file_content.content.decode("utf-8").split("\n")
                 wi.save_error_message(response_lines)
-        return out_workitems
 
 
-    def run_loop(self) -> t.List[WorkItem]:
-        out_work_items: t.List[WorkItem] = []
+    def run_loop(self) -> None:
         cnt_remaining_tasks: int = 0
         while (len(self.work_items) > 0) or (cnt_remaining_tasks > 0):
             try:
@@ -181,7 +235,7 @@ class OAI_Batch():
 
                 if len(finished_batches) > 0:
                     print("Some files ready to download")
-                    out_work_items.extend(self._download_and_save_finished_batches(finished_file_ids=finished_batches))
+                    self._download_and_save_finished_batches(finished_file_ids=finished_batches)
                     something_happened = True
 
                 if not something_happened:
@@ -192,4 +246,4 @@ class OAI_Batch():
                 print(e)
                 print("Waiting 2 minutes before another checks")
                 time.sleep(120)
-        return out_work_items
+        return
