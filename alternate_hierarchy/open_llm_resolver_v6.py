@@ -72,7 +72,8 @@ class ExtendCustomerDescriptionSumWorkItem(AbstractSelectionWorkItem):
         return "customer-extended"
 
     def get_jsonl_list(self) -> t.List[str]:
-        extend_description_prompt: str = """Zakazník poptává produkt s následujícím popisem. Nahraď všechny zkratky. Dále zkus odhadnout a rozepsat, 
+        extend_description_prompt: str = """Zakazník poptává produkt z portfolia výrobce vibrobetonových prvků, jako například
+dlažba, obrubníky a podobně, a příslušenství s následujícím popisem. Nahraď všechny zkratky. Dále zkus odhadnout a rozepsat, 
 jak by takový produkt mohl vypadat, identifikuj typ a určení výrobku, požadovaný materiál, 
 barvu a rozměry. Napiš jeden kratký odstavec s popisem. Odpovídej v češtině."""
 #         identify_colour_prompt: str = """Zakazník poptává produkt s následujícím popisem. Pokus se identifikovat z popisu barvu poptavaného zboží.

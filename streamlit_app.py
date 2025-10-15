@@ -1,4 +1,7 @@
+import os
+
 import streamlit as st
+import os
 
 st.set_page_config(
     page_title="BEST AI Search Engine",
@@ -28,3 +31,5 @@ with st.container(horizontal_alignment="center", vertical_alignment="center"):
         st.switch_page("pages/3_batched_hierarchy.py")
     if st.button("Flat search __(new)__"):
         st.switch_page("pages/4_flat_search.py")
+    if st.button("Chatbot Search __(new)__"):
+        st.switch_page("pages/5_chatbot_search.py")
