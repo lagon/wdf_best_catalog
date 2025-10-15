@@ -69,7 +69,7 @@ class OAI_Direct(OAI_Worker):
                         ChatCompletionUserMessageParam(role="user", content=wi_data["body"]["messages"][1]["content"])
                     ]
 
-                    response = self.client.chat.completions.create(model=wi_data["body"]["model"], messages=prompt, max_tokens=300)
+                    response = self.client.chat.completions.create(model=wi_data["body"]["model"], messages=prompt)
                     resp_parsed = json.loads(response.to_json())
                     resp = {
                         "custom_id": wi_data["custom_id"],
