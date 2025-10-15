@@ -92,10 +92,10 @@ def query_component() -> tuple[str, np.ndarray, bool] | None:
         height=INPUT_HEIGHT,
     )
     to_preprocess_query = st.checkbox(
-        "LLM query preprocessing (experimental)", disabled=True
+        "LLM query preprocessing (experimental)", disabled=False
     )
     to_verify_results = st.checkbox(
-        "LLM result verification (experimental)", disabled=True
+        "LLM result verification (experimental)", disabled=False
     )
     submitted = st.form_submit_button("Submit", type="primary")
     if not submitted or query_text == "":
@@ -210,10 +210,14 @@ def main():
         df = df[df["Select"] == "__YES__"]
         if to_verify_results:
             with st.spinner("Verifying results...", show_time=True):
-                df["Match"] = df["Product"].apply(
-                    lambda x: "__YES__"
-                    if is_match(st.session_state["query_text"], x)
-                    else "NO"
+                df["Match"] = (
+                    df["Product"]
+                    .iloc[:10]
+                    .apply(
+                        lambda x: "__YES__"
+                        if is_match(st.session_state["query_text"], x)
+                        else "NO"
+                    )
                 )
             st.table(df[["Distance", "Product", "Match"]])
         else:

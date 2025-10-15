@@ -191,10 +191,10 @@ def main():
             placeholder="Enter query here...",
         )
         st.session_state["query_preprocess"] = st.checkbox(
-            "LLM query preprocessing (experimental)", disabled=True
+            "LLM query preprocessing (experimental)", disabled=False
         )
         st.session_state["verify_results"] = st.checkbox(
-            "LLM result verification (experimental)", disabled=True
+            "LLM result verification (experimental)", disabled=False
         )
         if st.form_submit_button("Submit", type="primary") and query_text != "":
             clear_state()
@@ -250,7 +250,7 @@ def main():
 
             with st.spinner("Verifying results...", show_time=True):
                 for i, (d, m) in enumerate(zip(dists, metas)):
-                    if i < 20:
+                    if i < 10:
                         if is_match(st.session_state["query_text"], m["text"]):
                             match = "__YES__"
                         else:

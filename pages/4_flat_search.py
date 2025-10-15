@@ -61,11 +61,6 @@ def main():
             if c in m["colors"]:
                 cs.append((d, c))
 
-        # col1, col2 = st.columns([1, 1], gap="medium")
-        # col1.markdown("#### Products")
-        # col1.table(ps)
-        # col2.markdown("#### Colors")
-        # col2.table(cs)
         st.markdown("#### Products")
         st.table(ps)
 
@@ -75,7 +70,6 @@ def main():
     for i, m in enumerate(metas):
         c1.button(
             f"__{m['name']}__",
-            # f"{dists[i]:.4f} \n\n __{m['name']}__",
             help=f"Similarity: {dists[i]:.6f}",
             width="stretch",
             type="primary" if i == st.session_state["choice"] else "secondary",
