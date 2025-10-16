@@ -1,4 +1,4 @@
-import os
+import sys
 
 import streamlit as st
 import os
@@ -33,3 +33,6 @@ with st.container(horizontal_alignment="center", vertical_alignment="center"):
         st.switch_page("pages/4_flat_search.py")
     if st.button("Chatbot Search __(new)__"):
         st.switch_page("pages/5_chatbot_search.py")
+
+st.write(os.getcwd())
+st.write(sys.path)
