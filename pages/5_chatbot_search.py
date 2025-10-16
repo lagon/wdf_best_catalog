@@ -1,9 +1,13 @@
 import json
 import os
 import typing as t
+import sys
 
 import streamlit as st
 import openai as oai
+
+st.write(os.getcwd())
+st.write(sys.path)
 
 
 import oai_batch
