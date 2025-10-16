@@ -9,10 +9,8 @@ dependencies = [
     "openai>=2.1.0",
     "pandas>=2.3.3",
     "pybase64>=1.4.2",
-#    "pysqlite3>=0.5.4",
-#    "pysqlite3-binary>=0.5.4",
+    "pysqlite3-binary>=0.5.4",
     "scipy>=1.16.2",
     "streamlit>=1.50.0",
     "watchdog>=6.0.0",
-    ""
 ]
