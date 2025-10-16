@@ -6,13 +6,7 @@ import sys
 import streamlit as st
 import openai as oai
 
-st.write(os.getcwd())
-st.write(sys.path)
-
-
 import oai_batch
-from flat_catalog import Collection
-
 
 import alternate_hierarchy.open_llm_resolver_v6 as v6
 
