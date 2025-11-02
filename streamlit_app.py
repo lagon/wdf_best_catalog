@@ -31,3 +31,6 @@ with st.container(horizontal_alignment="center", vertical_alignment="center"):
         st.switch_page("pages/4_flat_search.py")
     if st.button("Chatbot Search __(new)__"):
         st.switch_page("pages/5_chatbot_search.py")
+    st.markdown("---")
+    if st.button("Email parser"):
+        st.switch_page("pages/6_email_parse.py")
