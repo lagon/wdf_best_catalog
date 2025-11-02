@@ -14,5 +14,6 @@ dependencies = [
     "streamlit>=1.50.0",
     "watchdog>=6.0.0",
     "pydantic>=2.12.2",
-    "pydantic-settings>=2.11.0"
+    "pydantic-settings>=2.11.0",
+    "extract-msg>=0.55.0",
 ]
